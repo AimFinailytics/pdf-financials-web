@@ -93,7 +93,7 @@ SUMMARY_LABELS = {
         "total revenue from operations",
         "net sales",
     ),
-    "PBT": ("profit before tax", "income before income taxes"),
+    "PBT": ("profit before tax", "income before income taxes", "before income taxes"),
     "PAT": ("profit for the year", "net income", "net profit for the"),
     "Total Assets": ("total assets",),
     "Total Equity": ("total equity", "total stockholders' equity", "total shareholders' equity"),
@@ -361,59 +361,129 @@ def detect_company(text: str) -> str | None:
     return None
 
 
+# Title phrases that, when they START a heading line, identify a primary
+# consolidated statement page (covers both US 10-K and Indian annual-report
+# wording).
+_TITLE_PATTERNS = {
+    "Income Statement": (
+        r"consolidated statements? of operations",
+        r"consolidated statements? of income",
+        r"consolidated statement of profit and loss",
+        r"consolidated statement of profit",
+        r"statement of audited consolidated financial results",
+    ),
+    "Balance Sheet": (
+        r"consolidated balance sheets?",
+    ),
+    "Cash Flow Statement": (
+        r"consolidated statements? of cash flows?",
+        r"consolidated cash flows? statement",
+        r"consolidated cash flow statements?",
+    ),
+}
+
+# Pages that mention the statement titles only in prose / listings — never the
+# primary statement page itself.
+_PAGE_EXCLUDE_MARKERS = (
+    "index to consolidated financial statements",
+    "report of independent registered public accounting firm",
+    "we have audited",
+    "item 8. financial statements",
+    "item 15",
+    "part iv",
+)
+
+_PERIOD_HEADER_RE = re.compile(
+    r"(year ended|quarter ended|months ended|period ended|as at|as of|"
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+\d{1,2}|\b20\d{2}\b)",
+    re.I,
+)
+
+
+def _title_heading_score(line: str, patterns: tuple[str, ...]) -> int:
+    """Score a line as a statement-title heading. A title that starts the line
+    and is followed by nothing / a date / "(in millions)" scores high; an index
+    entry ("... 38") or a mid-sentence mention scores 0."""
+    stripped = re.sub(r"\s+", " ", line).strip().lower().rstrip(".")
+    if not stripped or len(stripped) > 90:
+        return 0
+    for pat in patterns:
+        match = re.match(rf"{pat}\b", stripped)
+        if not match:
+            continue
+        rest = stripped[match.end():].strip(" .,:-")
+        if re.fullmatch(r"\d{1,4}", rest):  # index entry: title + page number
+            return 0
+        if rest == "" or rest.startswith("("):
+            return 3
+        if len(rest) <= 40 and _PERIOD_HEADER_RE.search(rest):  # "... as at March 31, 2023"
+            return 3
+        return 0  # title trails into a sentence -> notes / prose
+    return 0
+
+
+def _numeric_line_count(text: str) -> int:
+    count = 0
+    for line in text.splitlines():
+        if len(re.findall(r"\d", line)) >= 3 and re.search(r"\d[\d,]*", line):
+            count += 1
+    return count
+
+
 def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, set[int]]:
     found = {name: set() for name in STATEMENTS}
+    best: dict[str, tuple[int, int | None]] = {name: (0, None) for name in STATEMENTS}
+
     for page_no, text in pages:
         lower = text.lower()
-        head = lower[:1400]
-        has_cash_flow_anywhere = (
-            "consolidated statement of cash flow" in lower
-            or "consolidated statements of cash flow" in lower
-        )
-        if (
-            "consolidated" not in head
-            and "audited consolidated financial results" not in head
-            and not has_cash_flow_anywhere
-        ):
+        if any(marker in lower for marker in _PAGE_EXCLUDE_MARKERS):
             continue
-        if "independent auditor" in head:
+        numeric_lines = _numeric_line_count(text)
+        if numeric_lines < 5:  # a real statement page is dense with numbers
             continue
-        has_statement_header = any(
-            marker in head
-            for marker in (
-                "consolidated balance sheet",
-                "consolidated balance sheets",
-                "consolidated statement of profit",
-                "consolidated statements of operations",
-                "statement of audited consolidated financial results",
-            )
-        ) or has_cash_flow_anywhere
-        if "notes to consolidated financial statements" in head and not has_statement_header:
-            continue
-        if (
-            "consolidated statement of profit" in head
-            or "consolidated statements of operations" in head
-            or "statement of audited consolidated financial results" in head
-            or "consolidated statement of income" in head
-        ):
-            found["Income Statement"].add(page_no)
-        if "consolidated balance sheet" in head or "consolidated balance sheets" in head:
-            found["Balance Sheet"].add(page_no)
-        if has_cash_flow_anywhere:
-            found["Cash Flow Statement"].add(page_no)
-            if page_no + 1 <= len(pages):
-                next_text = pages[page_no][1].lower() if page_no < len(pages) else ""
-                if "continued" in next_text or "financing activities" in next_text:
-                    found["Cash Flow Statement"].add(page_no + 1)
+        lines = text.splitlines()
+        for name, patterns in _TITLE_PATTERNS.items():
+            heading = max((_title_heading_score(line, patterns) for line in lines), default=0)
+            if heading <= 0:
+                continue
+            score = heading * 100 + min(numeric_lines, 60)
+            if score > best[name][0]:
+                best[name] = (score, page_no)
 
-    for name, page_set in list(found.items()):
-        expanded = set(page_set)
-        for page_no in page_set:
-            if name == "Cash Flow Statement" and page_no + 1 <= len(pages):
-                next_text = pages[page_no][1].lower() if page_no < len(pages) else ""
-                if any(key in next_text for key in ("financing activities", "net cash", "cash and cash equivalents")):
-                    expanded.add(page_no + 1)
-        found[name] = expanded
+    for name, (_, page_no) in best.items():
+        if page_no is not None:
+            found[name].add(page_no)
+
+    # A statement can spill onto the following page (cash-flow financing section,
+    # balance-sheet equity half). Include the next page when it continues the
+    # table and is not itself another statement's title page.
+    page_text = {pno: txt for pno, txt in pages}
+    for name in ("Cash Flow Statement", "Balance Sheet"):
+        for page_no in list(found[name]):
+            nxt = page_text.get(page_no + 1, "")
+            if not nxt:
+                continue
+            if any(
+                _title_heading_score(line, pats)
+                for pats in _TITLE_PATTERNS.values()
+                for line in nxt.splitlines()
+            ):
+                continue
+            low = nxt.lower()
+            if _numeric_line_count(nxt) < 5:
+                continue
+            if name == "Cash Flow Statement":
+                keys = ("financing activities", "net cash", "cash and cash equivalents", "continued")
+                if any(key in low for key in keys):
+                    found[name].add(page_no + 1)
+            else:  # Balance Sheet — only the Indian two-page (assets | equity+liabilities) split,
+                   # never the separate Statement of Stockholders' Equity roll-forward.
+                if "stockholders" in low and "equity" in low and "statement" in low:
+                    continue
+                keys = ("total equity and liabilities", "total liabilities and equity", "continued")
+                if any(key in low for key in keys):
+                    found[name].add(page_no + 1)
     return found
 
 
@@ -428,6 +498,19 @@ def detect_periods(text: str, statement_name: str) -> list[str]:
 
     for idx, line in enumerate(lines[:20]):
         if "year ended december 31" in line.lower():
+            window = " ".join(lines[idx : idx + 3])
+            years = re.findall(r"\b(20\d{2})\b", window)
+            if years:
+                return [f"FY{year}" for year in _dedupe(years)]
+
+    # A column header anchored on a month/day date — "December 31," or
+    # "As at March 31, 2023" — possibly with the years on the next line. Grab the
+    # years from a short window. Covers US balance sheets and Indian statements
+    # whose period wording isn't "year ended". (normalize_text can fuse the date
+    # line and year line, so search a window rather than a single line.)
+    month = r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+    for idx, line in enumerate(lines[:20]):
+        if re.search(rf"{month}\s+\d{{1,2}}", line.lower()):
             window = " ".join(lines[idx : idx + 3])
             years = re.findall(r"\b(20\d{2})\b", window)
             if years:
