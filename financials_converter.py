@@ -162,7 +162,14 @@ def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path) -> ConversionResul
 def parse_pdf(path: Path) -> ParsedPdf:
     try:
         with pdfplumber.open(path) as pdf:
-            pages = [(i + 1, page.extract_text(x_tolerance=1, y_tolerance=3) or "") for i, page in enumerate(pdf.pages)]
+            pages = []
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                pages.append((i + 1, text))
+                # Release pdfplumber's cached layout objects for this page so a
+                # large report (hundreds of pages) doesn't accumulate hundreds
+                # of MB and get OOM-killed on a small instance.
+                page.flush_cache()
     except Exception as exc:
         return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
 
