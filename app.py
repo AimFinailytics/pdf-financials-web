@@ -46,6 +46,12 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/health")
+def health():
+    # Render (and any uptime monitor) pings this to confirm the app is live.
+    return jsonify({"status": "ok"}), 200
+
+
 @app.post("/api/convert")
 def convert():
     files = request.files.getlist("files")
