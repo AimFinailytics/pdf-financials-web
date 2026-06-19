@@ -140,10 +140,14 @@ def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path) -> ConversionResul
     for company, filings in grouped.items():
         filings.sort(key=lambda item: _period_sort_key(item.periods))
         company_periods = _combined_periods(filings)
+        # safe_filename the period tag too — a generic fallback like "Period 1"
+        # contains a space, which the download route's secure_filename() would
+        # rewrite to "_", breaking the download lookup.
+        period_tag = safe_filename(company_periods[-1]) if company_periods else "Output"
         out_name = (
             f"{safe_filename(company)}_Consolidated_FS_MultiYear.xlsx"
             if len(company_periods) > 2 or len(filings) > 1
-            else f"{safe_filename(company)}_Consolidated_FS_{company_periods[-1] if company_periods else 'Output'}.xlsx"
+            else f"{safe_filename(company)}_Consolidated_FS_{period_tag}.xlsx"
         )
         out_path = output_dir / out_name
         build_company_workbook(company, filings, out_path)
