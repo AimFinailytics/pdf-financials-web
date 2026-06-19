@@ -111,7 +111,12 @@ class ParsedPdf:
     source_name: str
     source_path: Path
     periods: list[str] = field(default_factory=list)
+    # statements[stmt][canonical_key] = {period: value}. The canonical key is used
+    # only to MERGE the same line across years; the verbatim label shown in the
+    # sheet is kept in display_labels, and the PDF row position in row_order.
     statements: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    display_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    row_order: dict[str, dict[str, int]] = field(default_factory=dict)
     skipped_reason: str | None = None
 
 
@@ -271,9 +276,11 @@ def parse_pdf(path: Path) -> ParsedPdf:
             periods = detect_periods(joined_first_pages + "\n" + statement_text, statement_name)
         if periods:
             all_periods.extend(periods)
-        rows = parse_statement_rows(statement_text, periods, statement_name)
+        rows, labels, order = parse_statement_rows(statement_text, periods, statement_name)
         if rows:
             parsed.statements[statement_name] = rows
+            parsed.display_labels[statement_name] = labels
+            parsed.row_order[statement_name] = order
 
     parsed.periods = _dedupe_periods(all_periods)
     if not parsed.periods:
@@ -539,17 +546,21 @@ def detect_periods(text: str, statement_name: str) -> list[str]:
     return [f"FY{year}" for year in years]
 
 
-def parse_statement_rows(text: str, periods: list[str], statement_name: str) -> dict[str, dict[str, float]]:
+def parse_statement_rows(
+    text: str, periods: list[str], statement_name: str
+) -> tuple[dict[str, dict[str, float]], dict[str, str], dict[str, int]]:
     periods = periods or []
     period_count = max(1, len(periods))
     rows: dict[str, dict[str, float]] = {}
+    labels: dict[str, str] = {}  # canonical key -> verbatim label as written on the PDF
+    order: dict[str, int] = {}   # canonical key -> first line position (PDF row order)
     keys = {
         "Income Statement": INCOME_KEYS,
         "Balance Sheet": BALANCE_KEYS,
         "Cash Flow Statement": CASH_FLOW_KEYS,
     }[statement_name]
 
-    for raw_line in normalize_text(text).splitlines():
+    for idx, raw_line in enumerate(normalize_text(text).splitlines()):
         line = raw_line.strip()
         if not line or len(line) < 4:
             continue
@@ -564,18 +575,20 @@ def parse_statement_rows(text: str, periods: list[str], statement_name: str) -> 
             continue
 
         values = numbers[:period_count] if statement_name == "Balance Sheet" else numbers[-period_count:]
-        label = strip_numbers_from_label(line)
-        label = standardize_label(label, statement_name)
-        if not label or len(label) < 3:
+        verbatim = re.sub(r"\s+", " ", strip_numbers_from_label(line)).strip(" -:;")
+        key = standardize_label(verbatim, statement_name)  # merge key only
+        if not key or len(key) < 3:
             continue
-        if re.fullmatch(r"[ivxlcdm.\s()-]+", label.lower()):
+        if re.fullmatch(r"[ivxlcdm.\s()-]+", key.lower()):
             continue
 
         if not periods:
-            periods = [f"Period {idx + 1}" for idx in range(period_count)]
-        rows[label] = {period: value for period, value in zip(periods[-len(values) :], values)}
+            periods = [f"Period {i + 1}" for i in range(period_count)]
+        rows[key] = {period: value for period, value in zip(periods[-len(values) :], values)}
+        labels[key] = verbatim or key  # show the PDF's own wording
+        order.setdefault(key, idx)
 
-    return rows
+    return rows, labels, order
 
 
 def normalize_text(text: str) -> str:
@@ -756,21 +769,15 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
         cell.alignment = Alignment(horizontal="center")
         cell.border = palette.header_border
 
-    labels = sorted(
-        {
-            label
-            for filing in filings
-            for label in filing.statements.get(statement, {}).keys()
-        },
-        key=lambda label: _preferred_label_order(statement, label),
-    )
+    keys = _ordered_keys(filings, statement)
 
-    for row_idx, label in enumerate(labels, 5):
-        ws.cell(row_idx, 1, label)
+    for row_idx, key in enumerate(keys, 5):
+        display = _display_label(filings, statement, key)
+        ws.cell(row_idx, 1, display)
         for period in periods:
-            value = _value_for_period(filings, statement, label, period)
+            value = _value_for_period(filings, statement, key, period)
             ws.cell(row_idx, periods.index(period) + 2, value)
-        style_row(ws, row_idx, len(periods) + 1, palette, total=_is_total_label(label))
+        style_row(ws, row_idx, len(periods) + 1, palette, total=_is_total_label(display))
 
 
 def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) -> None:
@@ -780,15 +787,13 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
     ws.column_dimensions["A"].width = 54
 
     companies = sorted(grouped)
-    labels = sorted(
-        {
-            label
-            for filings in grouped.values()
-            for filing in filings
-            for label in filing.statements.get(statement, {}).keys()
-        },
-        key=lambda label: _preferred_label_order(statement, label),
-    )
+    keys: list[str] = []
+    seen: set[str] = set()
+    for company in companies:
+        for key in _ordered_keys(grouped[company], statement):
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
 
     ws.cell(1, 1, f"Master Consolidated {statement}")
     ws.cell(1, 1).font = Font(bold=True, size=14, color="FFFFFF")
@@ -818,16 +823,21 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
             col += 1
         col += 1
 
-    for row_idx, label in enumerate(labels, 4):
-        ws.cell(row_idx, 1, label)
+    for row_idx, key in enumerate(keys, 4):
+        display = next(
+            (lbl for company in companies
+             if (lbl := _display_label(grouped[company], statement, key)) != key),
+            key,
+        )
+        ws.cell(row_idx, 1, display)
         col = 2
         for company in companies:
             filings = grouped[company]
             for period in _combined_periods(filings):
-                ws.cell(row_idx, col, _value_for_period(filings, statement, label, period))
+                ws.cell(row_idx, col, _value_for_period(filings, statement, key, period))
                 col += 1
             col += 1
-        style_row(ws, row_idx, max(1, col - 1), palette, total=_is_total_label(label))
+        style_row(ws, row_idx, max(1, col - 1), palette, total=_is_total_label(display))
 
 
 def style_row(ws, row_idx: int, max_col: int, palette: "WorkbookPalette", total: bool = False) -> None:
@@ -1019,6 +1029,31 @@ _STATEMENT_ORDER = {
         "cash, cash equivalents", "cash and cash equivalents",
     ],
 }
+
+
+def _ordered_keys(filings: list[ParsedPdf], statement: str) -> list[str]:
+    """Canonical keys ordered by each line's AVERAGE normalized position across
+    the filings it appears in. Using the average (rather than a single filing's
+    order) keeps the PDF's row order even when a given year's report didn't parse
+    every line, so nothing gets dumped at the bottom."""
+    positions: dict[str, list[float]] = {}
+    for filing in filings:
+        order = filing.row_order.get(statement, {})
+        if not order:
+            continue
+        span = max(max(order.values()), 1)
+        for key, idx in order.items():
+            positions.setdefault(key, []).append(idx / span)
+    return sorted(positions, key=lambda k: sum(positions[k]) / len(positions[k]))
+
+
+def _display_label(filings: list[ParsedPdf], statement: str, key: str) -> str:
+    """The verbatim label as written on the PDF, preferring the newest filing."""
+    for filing in reversed(filings):
+        label = filing.display_labels.get(statement, {}).get(key)
+        if label:
+            return label
+    return key
 
 
 def _preferred_label_order(statement: str, label: str) -> tuple[int, str]:
