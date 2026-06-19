@@ -809,9 +809,13 @@ def _combined_periods(filings: list[ParsedPdf]) -> list[str]:
 def _dedupe_periods(periods: list[str]) -> list[str]:
     clean = []
     for period in periods:
+        if not period:
+            continue
         match = re.search(r"20\d{2}", period)
-        if match:
-            clean.append(f"FY{match.group(0)}")
+        # Prefer a clean FYxxxx label when a year is present, but keep generic
+        # labels (e.g. "Period 1") so values still render when year detection
+        # couldn't identify the column headers.
+        clean.append(f"FY{match.group(0)}" if match else period)
     return _dedupe(clean)
 
 
