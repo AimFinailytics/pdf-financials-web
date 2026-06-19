@@ -159,21 +159,92 @@ def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path) -> ConversionResul
     return ConversionResult(output_paths=output_paths, summaries=summaries, skipped=skipped)
 
 
+# PDFs with more pages than this use the low-memory two-phase reader, so a big
+# annual report (e.g. a 90-page US filing) doesn't run pdfminer over every page
+# and get OOM-killed on a small instance. Smaller reports keep the original,
+# proven full-pdfplumber path unchanged.
+LARGE_PDF_PAGES = 30
+
+
+def _pdf_page_count(path: Path) -> int:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(path))
+    try:
+        return len(pdf)
+    finally:
+        pdf.close()
+
+
+def _scan_text_pdfium(path: Path) -> list[tuple[int, str]]:
+    """Cheap, low-memory full-document text scan via pypdfium2 (C-backed; each
+    page is read and released immediately). Used only to locate statement pages
+    and the company name in large PDFs — not for precise number parsing."""
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(path))
+    out: list[tuple[int, str]] = []
+    try:
+        for i in range(len(pdf)):
+            page = pdf.get_page(i)
+            textpage = page.get_textpage()
+            try:
+                text = textpage.get_text_range() or ""
+            finally:
+                textpage.close()
+                page.close()
+            out.append((i + 1, text))
+    finally:
+        pdf.close()
+    return out
+
+
+def _extract_pages_pdfplumber(path: Path, page_numbers: set[int]) -> dict[int, str]:
+    """Run pdfplumber's precise extraction on ONLY the given pages, flushing each
+    page's cache so peak memory stays bounded regardless of document size."""
+    result: dict[int, str] = {}
+    if not page_numbers:
+        return result
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            page_no = i + 1
+            if page_no in page_numbers:
+                result[page_no] = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            page.flush_cache()
+    return result
+
+
 def parse_pdf(path: Path) -> ParsedPdf:
     try:
-        with pdfplumber.open(path) as pdf:
-            pages = []
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
-                pages.append((i + 1, text))
-                # Release pdfplumber's cached layout objects for this page so a
-                # large report (hundreds of pages) doesn't accumulate hundreds
-                # of MB and get OOM-killed on a small instance.
-                page.flush_cache()
-    except Exception as exc:
-        return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
+        page_count = _pdf_page_count(path)
+    except Exception:
+        page_count = 0  # fall through to the pdfplumber path, which surfaces a real error
 
-    statement_pages = find_statement_pages(pages)
+    if page_count > LARGE_PDF_PAGES:
+        # Low-memory path: cheap full scan to find the statement pages, then
+        # deep-parse only those few pages with pdfplumber for accurate numbers.
+        try:
+            scan_pages = _scan_text_pdfium(path)
+            statement_pages = find_statement_pages(scan_pages)
+            needed = {p for page_set in statement_pages.values() for p in page_set}
+            precise = _extract_pages_pdfplumber(path, needed)
+        except Exception as exc:
+            return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
+        # Use precise pdfplumber text on statement pages; the cheap scan text on
+        # the rest (only consumed for company-name detection / preview).
+        pages = [(page_no, precise.get(page_no, text)) for page_no, text in scan_pages]
+    else:
+        try:
+            with pdfplumber.open(path) as pdf:
+                pages = []
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                    pages.append((i + 1, text))
+                    # Release pdfplumber's cached layout objects for this page.
+                    page.flush_cache()
+        except Exception as exc:
+            return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
+        statement_pages = find_statement_pages(pages)
     statement_preview = "\n".join(
         text
         for page_no, text in pages
