@@ -552,31 +552,36 @@ def parse_statement_rows(
     periods = periods or []
     period_count = max(1, len(periods))
     rows: dict[str, dict[str, float]] = {}
-    labels: dict[str, str] = {}  # canonical key -> verbatim label as written on the PDF
+    labels: dict[str, str] = {}  # canonical key -> clean display label
     order: dict[str, int] = {}   # canonical key -> first line position (PDF row order)
-    keys = {
-        "Income Statement": INCOME_KEYS,
-        "Balance Sheet": BALANCE_KEYS,
-        "Cash Flow Statement": CASH_FLOW_KEYS,
-    }[statement_name]
 
     for idx, raw_line in enumerate(normalize_text(text).splitlines()):
         line = raw_line.strip()
         if not line or len(line) < 4:
             continue
         lower = line.lower()
-        if not any(key in lower for key in keys):
-            continue
         if any(skip in lower for skip in ("see accompanying notes", "corporate overview", "statutory reports")):
             continue
 
         numbers = extract_numbers(line)
-        if len(numbers) < period_count:
+        # A real statement row has exactly the period columns (allow one stray,
+        # e.g. a note reference). The statement page is detected precisely, so
+        # there are no footnote tables here to capture extra numbers from.
+        if not (period_count <= len(numbers) <= period_count + 1):
+            continue
+        text_part = strip_numbers_from_label(line)
+        if not re.search(r"[A-Za-z]", text_part) or len(text_part.strip()) < 3:
+            continue
+        # Skip the period-header line itself ("Year Ended December 31, 2022 2023"),
+        # whose "numbers" are just years/dates, not financial values.
+        if re.search(_MONTH_RE, lower) and all(1900 <= abs(n) <= 2100 for n in numbers):
+            continue
+        if lower.startswith("year ended") or "months ended" in lower or lower.strip() in ("period", "particulars"):
             continue
 
         values = numbers[:period_count] if statement_name == "Balance Sheet" else numbers[-period_count:]
-        verbatim = re.sub(r"\s+", " ", strip_numbers_from_label(line)).strip(" -:;")
-        key = standardize_label(verbatim, statement_name)  # merge key only
+        raw_label = re.sub(r"\s+", " ", text_part).strip(" -:;*")
+        key = standardize_label(raw_label, statement_name)  # merge key only
         if not key or len(key) < 3:
             continue
         if re.fullmatch(r"[ivxlcdm.\s()-]+", key.lower()):
@@ -585,7 +590,7 @@ def parse_statement_rows(
         if not periods:
             periods = [f"Period {i + 1}" for i in range(period_count)]
         rows[key] = {period: value for period, value in zip(periods[-len(values) :], values)}
-        labels[key] = verbatim or key  # show the PDF's own wording
+        labels[key] = clean_label(raw_label)  # polished Title Case for display
         order.setdefault(key, idx)
 
     return rows, labels, order
@@ -661,6 +666,8 @@ def standardize_label(label: str, statement_name: str) -> str:
             return "Profit Before Tax"
         if "for income tax" in lower and ("provision" in lower or "benefit" in lower):
             return "Provision for Income Taxes"
+        if "technology and" in lower and ("content" in lower or "infrastructure" in lower):
+            return "Technology and Infrastructure"
         if (
             "profit for the year" in lower
             or "net income" in lower
@@ -708,6 +715,44 @@ def title_company(value: str) -> str:
     return value
 
 
+_SMALL_WORDS = {"of", "and", "the", "for", "to", "in", "on", "a", "an", "or",
+                "per", "by", "with", "from", "as", "at"}
+_MONTH_RE = (
+    r"(january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\s+\d{1,2}"
+)
+
+
+def clean_label(label: str) -> str:
+    """Polished finance Title Case for display, e.g. 'net product sales' ->
+    'Net Product Sales', 'cost of sales' -> 'Cost of Sales'. Keeps small words
+    lowercase (except first), preserves hyphen casing and parenthetical words."""
+    label = re.sub(r"\s+", " ", label).strip(" -:;*,.")
+    if not label:
+        return label
+
+    def fix(token: str, first: bool) -> str:
+        out = []
+        for piece in re.split(r"(-)", token):
+            if piece == "-":
+                out.append(piece)
+                continue
+            match = re.match(r"^([^A-Za-z]*)(.*)$", piece)
+            lead, rest = match.group(1), match.group(2)
+            if rest:
+                low = rest.lower()
+                if not first and low in _SMALL_WORDS:
+                    rest = low
+                else:
+                    rest = rest[0].upper() + rest[1:].lower()
+            out.append(lead + rest)
+            first = False
+        return "".join(out)
+
+    words = label.split(" ")
+    return " ".join(fix(w, i == 0) for i, w in enumerate(words))
+
+
 def title_label(value: str) -> str:
     keep_upper = {"EPS", "PBT", "PAT", "OCI", "AWS"}
     words = []
@@ -741,52 +786,269 @@ def build_master_workbook(grouped: dict[str, list[ParsedPdf]], out_path: Path) -
     wb.save(out_path)
 
 
+# ----- analyst-grade statement styling (ported from the A2E layout) -----
+_AS_HEAD = PatternFill("solid", fgColor="1B3A5C")
+_AS_SUBHEAD = PatternFill("solid", fgColor="FF9900")
+_AS_SECTION = PatternFill("solid", fgColor="FFF3E0")
+_AS_TOTAL = PatternFill("solid", fgColor="FFE0B2")
+_AS_ALT = PatternFill("solid", fgColor="FAFAFA")
+_AS_WHITE = PatternFill("solid", fgColor="FFFFFF")
+_AS_NOTE = PatternFill("solid", fgColor="FFF9F0")
+_AS_YEAR = PatternFill("solid", fgColor="B35900")
+
+_AS_TITLE_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=14)
+_AS_SUB_FONT = Font(name="Calibri", bold=True, color="1B3A5C", size=10)
+_AS_YEAR_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+_AS_SEC_FONT = Font(name="Calibri", bold=True, color="1B3A5C", size=10)
+_AS_NORM_FONT = Font(name="Calibri", color="000000", size=10)
+_AS_NOTE_FONT = Font(name="Calibri", italic=True, color="595959", size=9)
+_AS_THIN = Side(style="thin", color="FFB74D")
+_AS_MED = Side(style="medium", color="FF9900")
+
+# Ordered sections per statement and the label keywords that fall under each.
+_SECTIONS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
+    "Income Statement": [
+        ("I.  REVENUE", ("product sales", "service sales", "sale of goods", "revenue from operations",
+                         "total net sales", "total revenue", "operating revenue", "net sales", "total income")),
+        ("II. OPERATING EXPENSES", ("cost of sales", "cost of materials", "cost of goods", "purchases of stock",
+                         "changes in inventories", "fulfillment", "technology", "content", "sales and marketing",
+                         "general and administrative", "employee benefit", "depreciation", "other operating expense",
+                         "other expense", "total operating expense", "total expense")),
+        ("III. OPERATING & NON-OPERATING INCOME", ("operating income", "operating profit", "interest income",
+                         "finance income", "interest expense", "finance cost", "other income",
+                         "total non-operating", "exceptional")),
+        ("IV. TAXES & BOTTOM LINE", ("before income tax", "before tax", "provision for income tax", "benefit",
+                         "tax expense", "current tax", "deferred tax", "income tax", "equity-method",
+                         "net income", "profit for the year", "profit after tax")),
+        ("V.  COMPREHENSIVE INCOME", ("comprehensive",)),
+        ("VI. EARNINGS PER SHARE", ("earnings per share", "per share", "weighted", "basic", "diluted")),
+    ],
+    "Balance Sheet": [
+        ("A.  CURRENT ASSETS", ("cash and cash equivalent", "bank balance", "marketable securities",
+                         "current investment", "inventories", "accounts receivable", "trade receivable",
+                         "prepaid", "other current asset", "total current assets")),
+        ("B.  NON-CURRENT ASSETS", ("property and equipment", "property, plant", "fixed asset", "right-of-use",
+                         "operating lease", "goodwill", "intangible", "non-current investment",
+                         "deferred tax asset", "other asset", "total non-current assets", "total assets")),
+        ("C.  CURRENT LIABILITIES", ("accounts payable", "trade payable", "accrued", "unearned", "short-term debt",
+                         "short-term borrowing", "current portion", "other current liabilit", "total current liabilities")),
+        ("D.  NON-CURRENT LIABILITIES", ("long-term debt", "long-term borrowing", "long-term lease", "lease liabilit",
+                         "deferred tax liabilit", "other long-term", "other non-current liabilit",
+                         "total non-current liabilities", "total liabilities")),
+        ("E.  STOCKHOLDERS' EQUITY", ("common stock", "preferred stock", "share capital", "additional paid-in",
+                         "securities premium", "treasury stock", "retained earnings", "reserves", "accumulated",
+                         "other equity", "total stockholders", "total shareholders", "total equity",
+                         "total liabilities and", "total equity and liabilities")),
+    ],
+    "Cash Flow Statement": [
+        ("A.  OPERATING ACTIVITIES", ("net income", "profit before tax", "profit for the year", "depreciation",
+                         "amortization", "stock-based compensation", "deferred income tax", "non-operating expense",
+                         "working capital", "changes in", "accounts receivable", "inventories", "accounts payable",
+                         "accrued", "unearned", "other assets", "cash generated from operation", "income tax paid",
+                         "operating lease assets", "net cash provided by operating", "net cash generated from operating",
+                         "net cash from operating", "net cash used in operating", "net cash provided by (used in) operating")),
+        ("B.  INVESTING ACTIVITIES", ("purchases of property", "purchase of property", "proceeds from property",
+                         "purchases of marketable", "sales and maturities", "acquisitions", "purchase of investment",
+                         "net cash used in investing", "net cash provided by (used in) investing",
+                         "net cash from investing", "net cash generated from investing")),
+        ("C.  FINANCING ACTIVITIES", ("repurchased", "buyback", "proceeds from long-term debt",
+                         "repayments of long-term debt", "proceeds from short-term", "repayments of short-term",
+                         "principal repayments of finance", "principal repayments of financing", "dividend",
+                         "proceeds from issuance", "net cash used in financing",
+                         "net cash provided by (used in) financing", "net cash from financing")),
+        ("D.  NET CHANGE IN CASH", ("foreign currency effect", "net increase", "net decrease",
+                         "cash, cash equivalents", "cash and cash equivalents")),
+    ],
+}
+
+
+def _classify_section(statement: str, label: str) -> int:
+    """Index of the section this line belongs to (longest keyword match wins).
+    -1 means unclassified (rendered after the sections, ungrouped)."""
+    lower = label.lower()
+    best_idx, best_len = -1, 0
+    for idx, (_, keywords) in enumerate(_SECTIONS.get(statement, [])):
+        for kw in keywords:
+            if kw in lower and len(kw) > best_len:
+                best_idx, best_len = idx, len(kw)
+    return best_idx
+
+
+_DROP_LABELS = {"basic", "diluted", "period", "marketing", "december", "particulars",
+                "issued shares - and", "outstanding shares - and"}
+
+
+def _drop_row(label: str) -> bool:
+    """Known terse footnote fragments that broadened extraction picks up."""
+    return label.strip().lower() in _DROP_LABELS
+
+
+def _is_noise_label(label: str) -> bool:
+    low = label.strip().lower()
+    if len(low) < 6 or len(low.split()) < 2:
+        return True
+    if low.endswith((" and", " - and", " -", " of", " or", ",")):
+        return True
+    return False
+
+
+def _is_subtotal(label: str) -> bool:
+    low = label.lower().strip()
+    if low.startswith("total") or "net cash" in low:
+        return True
+    return low in {
+        "operating income", "operating profit", "gross profit",
+        "income (loss) before income taxes", "income before income taxes", "profit before tax",
+        "net income", "net income (loss)", "profit for the year",
+        "comprehensive income (loss)", "comprehensive income",
+    }
+
+
+def _as_row(ws, row, label, vals, indent=0, total=False, ncols=0):
+    fill = _AS_TOTAL if total else (_AS_ALT if row % 2 == 0 else _AS_WHITE)
+    font = _AS_SEC_FONT if total else _AS_NORM_FONT
+    border = Border(top=_AS_THIN, bottom=_AS_MED) if total else Border(bottom=_AS_THIN)
+    c1 = ws.cell(row, 1, "    " * indent + label)
+    c1.fill, c1.font, c1.border = fill, font, border
+    c1.alignment = Alignment(horizontal="left", vertical="center")
+    for i, val in enumerate(vals, 2):
+        c = ws.cell(row, i, val)
+        c.fill, c.font, c.border = fill, font, border
+        c.number_format = "#,##0"
+        c.alignment = Alignment(horizontal="right", vertical="center")
+
+
 def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement: str, periods: list[str]) -> None:
-    palette = WorkbookPalette()
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "B5"
-    ws.column_dimensions["A"].width = 54
-    for col_idx in range(2, len(periods) + 2):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+    ncols = len(periods)
+    last_col = get_column_letter(ncols + 1)
+    ws.column_dimensions["A"].width = 56
+    for col in range(2, ncols + 2):
+        ws.column_dimensions[get_column_letter(col)].width = 15
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, len(periods) + 1))
-    title = ws.cell(1, 1, company)
-    title.fill = palette.dark
-    title.font = Font(bold=True, color="FFFFFF", size=14)
-    title.alignment = Alignment(horizontal="center")
+    # Title block
+    ws.merge_cells(f"A1:{last_col}1")
+    ws.row_dimensions[1].height = 26
+    c = ws.cell(1, 1, company.upper())
+    c.fill, c.font = _AS_HEAD, _AS_TITLE_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    for col in range(2, ncols + 2):
+        ws.cell(1, col).fill = _AS_HEAD
+    ws.merge_cells(f"A2:{last_col}2")
+    c = ws.cell(2, 1, f"CONSOLIDATED {statement.upper()}")
+    c.fill, c.font = _AS_SUBHEAD, _AS_SUB_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    span = f"{periods[0]} to {periods[-1]}" if periods else ""
+    ws.merge_cells(f"A3:{last_col}3")
+    c = ws.cell(3, 1, f"Multi-Year {span}  |  Figures in millions as reported  |  {company}")
+    c.fill, c.font = _AS_NOTE, _AS_NOTE_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
 
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(2, len(periods) + 1))
-    subtitle = ws.cell(2, 1, f"Consolidated {statement}")
-    subtitle.fill = palette.mid
-    subtitle.font = Font(bold=True, color="FFFFFF")
-    subtitle.alignment = Alignment(horizontal="center")
-
-    headers = ["Line Item", *periods]
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(4, col_idx, header)
-        cell.fill = palette.mid
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(horizontal="center")
-        cell.border = palette.header_border
+    # Column headers
+    ws.row_dimensions[5].height = 26
+    ws.freeze_panes = "B6"
+    h = ws.cell(5, 1, "Particulars")
+    h.fill, h.font = _AS_SUBHEAD, _AS_SUB_FONT
+    h.alignment = Alignment(horizontal="center", vertical="center")
+    h.border = Border(top=_AS_MED, bottom=_AS_MED)
+    for i, period in enumerate(periods, 2):
+        c = ws.cell(5, i, f"{period}\n(Mn)")
+        c.fill, c.font = _AS_YEAR, _AS_YEAR_FONT
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = Border(top=_AS_MED, bottom=_AS_MED)
 
     keys = _ordered_keys(filings, statement)
+    # group keys by section, preserving statement order within each
+    sections = _SECTIONS.get(statement, [])
+    buckets: dict[int, list[str]] = {i: [] for i in range(len(sections))}
+    leftovers: list[str] = []
+    for key in keys:
+        label = _display_label(filings, statement, key)
+        if _drop_row(label):
+            continue
+        idx = _classify_section(statement, label)
+        if idx < 0 and _is_noise_label(label):
+            continue  # unclassified footnote / wrapped-line fragment
+        (buckets[idx] if idx >= 0 else leftovers).append(key)
 
-    for row_idx, key in enumerate(keys, 5):
-        display = _display_label(filings, statement, key)
-        ws.cell(row_idx, 1, display)
-        for period in periods:
-            value = _value_for_period(filings, statement, key, period)
-            ws.cell(row_idx, periods.index(period) + 2, value)
-        style_row(ws, row_idx, len(periods) + 1, palette, total=_is_total_label(display))
+    row = 6
+    for sec_idx, (sec_label, _) in enumerate(sections):
+        sec_keys = buckets[sec_idx]
+        if not sec_keys:
+            continue
+        ws.row_dimensions[row].height = 16
+        for col in range(1, ncols + 2):
+            cell = ws.cell(row, col)
+            cell.fill = _AS_SECTION
+            if col == 1:
+                cell.value = sec_label
+                cell.font = _AS_SEC_FONT
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+        row += 1
+        for key in sec_keys:
+            label = _display_label(filings, statement, key)
+            vals = [_value_for_period(filings, statement, key, p) for p in periods]
+            total = _is_subtotal(label)
+            _as_row(ws, row, label, vals, indent=0 if total else 1, total=total, ncols=ncols)
+            row += 1
+    for key in leftovers:
+        label = _display_label(filings, statement, key)
+        vals = [_value_for_period(filings, statement, key, p) for p in periods]
+        _as_row(ws, row, label, vals, indent=1, total=_is_subtotal(label), ncols=ncols)
+        row += 1
 
 
 def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) -> None:
-    palette = WorkbookPalette()
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "B4"
-    ws.column_dimensions["A"].width = 54
-
+    ws.column_dimensions["A"].width = 56
     companies = sorted(grouped)
+
+    # company -> its period columns; build the flat column plan (with a blank
+    # spacer column between companies).
+    plan: list[tuple[str, str, int]] = []  # (company, period, col)
+    col = 2
+    company_spans: list[tuple[str, int, int]] = []
+    for company in companies:
+        periods = _combined_periods(grouped[company])
+        if not periods:
+            continue
+        start = col
+        for period in periods:
+            plan.append((company, period, col))
+            ws.column_dimensions[get_column_letter(col)].width = 15
+            col += 1
+        company_spans.append((company, start, col - 1))
+        col += 1  # spacer
+    last_col_idx = max(col - 2, 2)
+    last_col = get_column_letter(last_col_idx)
+
+    # Title block
+    ws.merge_cells(f"A1:{last_col}1")
+    ws.row_dimensions[1].height = 26
+    c = ws.cell(1, 1, f"MASTER — CONSOLIDATED {statement.upper()}")
+    c.fill, c.font = _AS_HEAD, _AS_TITLE_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    for cc in range(2, last_col_idx + 1):
+        ws.cell(1, cc).fill = _AS_HEAD
+
+    # Company group headers (row 3) + period headers (row 4)
+    hc = ws.cell(3, 1, "Particulars")
+    hc.fill, hc.font = _AS_SUBHEAD, _AS_SUB_FONT
+    hc.alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(4, 1).fill = _AS_SUBHEAD
+    for company, start, end in company_spans:
+        ws.merge_cells(start_row=3, start_column=start, end_row=3, end_column=end)
+        cc = ws.cell(3, start, company)
+        cc.fill, cc.font = _AS_SUBHEAD, _AS_SUB_FONT
+        cc.alignment = Alignment(horizontal="center", vertical="center")
+    for company, period, ccol in plan:
+        c = ws.cell(4, ccol, f"{period}\n(Mn)")
+        c.fill, c.font = _AS_YEAR, _AS_YEAR_FONT
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[4].height = 26
+    ws.freeze_panes = "B5"
+
+    # ordered, classified keys (union across companies)
     keys: list[str] = []
     seen: set[str] = set()
     for company in companies:
@@ -795,49 +1057,54 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
                 seen.add(key)
                 keys.append(key)
 
-    ws.cell(1, 1, f"Master Consolidated {statement}")
-    ws.cell(1, 1).font = Font(bold=True, size=14, color="FFFFFF")
-    ws.cell(1, 1).fill = palette.dark
-    ws.cell(3, 1, "Line Item")
-    ws.cell(3, 1).font = Font(bold=True, color="FFFFFF")
-    ws.cell(3, 1).fill = palette.mid
+    def disp(key: str) -> str:
+        return next((lbl for company in companies
+                     if (lbl := _display_label(grouped[company], statement, key)) != key), key)
 
-    col = 2
-    for company in companies:
-        periods = _combined_periods(grouped[company])
-        if not periods:
+    sections = _SECTIONS.get(statement, [])
+    buckets: dict[int, list[str]] = {i: [] for i in range(len(sections))}
+    leftovers: list[str] = []
+    for key in keys:
+        label = disp(key)
+        if _drop_row(label):
             continue
-        start_col = col
-        end_col = col + len(periods) - 1
-        ws.merge_cells(start_row=2, start_column=start_col, end_row=2, end_column=end_col)
-        cell = ws.cell(2, start_col, company)
-        cell.fill = palette.dark
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(horizontal="center")
-        for period in periods:
-            ws.cell(3, col, period)
-            ws.cell(3, col).fill = palette.mid
-            ws.cell(3, col).font = Font(bold=True, color="FFFFFF")
-            ws.cell(3, col).alignment = Alignment(horizontal="center")
-            ws.column_dimensions[get_column_letter(col)].width = 16
-            col += 1
-        col += 1
+        idx = _classify_section(statement, label)
+        if idx < 0 and _is_noise_label(label):
+            continue
+        (buckets[idx] if idx >= 0 else leftovers).append(key)
 
-    for row_idx, key in enumerate(keys, 4):
-        display = next(
-            (lbl for company in companies
-             if (lbl := _display_label(grouped[company], statement, key)) != key),
-            key,
-        )
-        ws.cell(row_idx, 1, display)
-        col = 2
-        for company in companies:
-            filings = grouped[company]
-            for period in _combined_periods(filings):
-                ws.cell(row_idx, col, _value_for_period(filings, statement, key, period))
-                col += 1
-            col += 1
-        style_row(ws, row_idx, max(1, col - 1), palette, total=_is_total_label(display))
+    def render(row: int, key: str) -> None:
+        label = disp(key)
+        total = _is_subtotal(label)
+        fill = _AS_TOTAL if total else (_AS_ALT if row % 2 == 0 else _AS_WHITE)
+        font = _AS_SEC_FONT if total else _AS_NORM_FONT
+        border = Border(top=_AS_THIN, bottom=_AS_MED) if total else Border(bottom=_AS_THIN)
+        c1 = ws.cell(row, 1, ("" if total else "    ") + label)
+        c1.fill, c1.font, c1.border = fill, font, border
+        c1.alignment = Alignment(horizontal="left", vertical="center")
+        for company, period, ccol in plan:
+            c = ws.cell(row, ccol, _value_for_period(grouped[company], statement, key, period))
+            c.fill, c.font, c.border = fill, font, border
+            c.number_format = "#,##0"
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+    row = 5
+    for sec_idx, (sec_label, _) in enumerate(sections):
+        if not buckets[sec_idx]:
+            continue
+        for cc in range(1, last_col_idx + 1):
+            cell = ws.cell(row, cc)
+            cell.fill = _AS_SECTION
+            if cc == 1:
+                cell.value = sec_label
+                cell.font = _AS_SEC_FONT
+        row += 1
+        for key in buckets[sec_idx]:
+            render(row, key)
+            row += 1
+    for key in leftovers:
+        render(row, key)
+        row += 1
 
 
 def style_row(ws, row_idx: int, max_col: int, palette: "WorkbookPalette", total: bool = False) -> None:
