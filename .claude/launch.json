@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pdf-financials-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["app.py"],
+      "port": 5050
+    }
+  ]
+}

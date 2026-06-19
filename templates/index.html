@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Financial Statement Converter</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script defer src="https://unpkg.com/lucide@latest"></script>
+    <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">PDF to Excel</p>
+          <h1>Financial Statement Converter</h1>
+        </div>
+        <span class="status-pill" id="statusPill">Ready</span>
+      </header>
+
+      <section class="workspace">
+        <form class="upload-panel" id="uploadForm">
+          <div class="dropzone" id="dropzone">
+            <input id="fileInput" name="files" type="file" accept="application/pdf,.pdf" multiple />
+            <i data-lucide="upload-cloud"></i>
+            <div>
+              <strong>Drop PDFs here</strong>
+              <span>or choose files</span>
+            </div>
+          </div>
+
+          <div class="file-strip" id="fileList">
+            <span class="empty">No PDFs selected</span>
+          </div>
+
+          <button class="primary-action" id="convertButton" type="submit">
+            <i data-lucide="file-spreadsheet"></i>
+            <span>Convert</span>
+          </button>
+        </form>
+
+        <section class="results-panel" id="resultsPanel" hidden>
+          <div class="panel-header">
+            <h2>Outputs</h2>
+            <span id="outputCount"></span>
+          </div>
+          <div class="downloads" id="downloads"></div>
+          <div class="skipped" id="skipped" hidden></div>
+        </section>
+      </section>
+
+      <section class="summary-grid" id="summaryGrid"></section>
+    </main>
+  </body>
+</html>
