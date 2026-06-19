@@ -621,11 +621,18 @@ def standardize_label(label: str, statement_name: str) -> str:
     lower = label.lower()
 
     if statement_name == "Balance Sheet":
-        if "total equity and liabilities" in lower:
+        # Grand total ("Total liabilities and stockholders' equity") must be
+        # caught before the bare "total liabilities" check, or it gets mislabeled
+        # as Total Liabilities with the wrong (= total assets) value.
+        if "total liabilities and" in lower or "total equity and liabilities" in lower:
             return "Total Equity and Liabilities"
+        if "total current assets" in lower:
+            return "Total Current Assets"
+        if "total current liabilities" in lower:
+            return "Total Current Liabilities"
         if "total assets" in lower:
             return "Total Assets"
-        if "total equity" in lower:
+        if "total stockholders" in lower or "total shareholders" in lower or "total equity" in lower:
             return "Total Equity"
         if "total liabilities" in lower:
             return "Total Liabilities"
@@ -634,10 +641,26 @@ def standardize_label(label: str, statement_name: str) -> str:
             return "Sale of Goods"
         if "other operating revenues" in lower:
             return "Other Operating Revenues"
-        if "profit before tax" in lower or "income before income taxes" in lower:
+        # Canonicalize across year-to-year wording changes so the same concept
+        # is ONE row (e.g. "Income (loss) before income taxes" == "Income before
+        # income taxes"; "Net income (loss)" == "Net income").
+        if "before income tax" in lower or "profit before tax" in lower or "profit/(loss) before tax" in lower:
             return "Profit Before Tax"
-        if "profit for the year" in lower or lower == "net income" or "net profit for the" in lower:
+        if "for income tax" in lower and ("provision" in lower or "benefit" in lower):
+            return "Provision for Income Taxes"
+        if (
+            "profit for the year" in lower
+            or "net income" in lower
+            or "net profit" in lower
+            or "profit/(loss) for the" in lower
+        ):
             return "Profit for the Year"
+
+    if statement_name == "Cash Flow Statement":
+        # Wording of this line drifts year to year ("... and other" vs
+        # "... non-marketable investments, and other"); collapse to one row.
+        if "acquisitions" in lower and "net of cash acquired" in lower:
+            return "Acquisitions, Net of Cash Acquired, and Other"
 
     replacements = {
         "total revenue from operations": "Revenue from Operations",
@@ -934,42 +957,80 @@ def _value_for_period(
     return None
 
 
+# Ordered templates that lay each statement out top-to-bottom the way it reads
+# on the page. A label is ordered by the LONGEST template phrase it contains, so
+# overlaps resolve correctly (e.g. "non-operating income" -> "total non-operating",
+# not "operating income").
+_STATEMENT_ORDER = {
+    "Income Statement": [
+        "revenue from operations", "sale of goods", "net product sales",
+        "net service sales", "other operating revenue",
+        "total net sales", "total revenue", "total income",
+        "cost of sales", "cost of materials", "cost of goods", "purchases of stock-in-trade",
+        "changes in inventories", "employee benefit", "fulfillment", "technology",
+        "sales and marketing", "general and administrative", "depreciation and amorti",
+        "other operating expense", "other expense",
+        "total operating expense", "total expense",
+        "operating income", "operating profit",
+        "interest income", "finance income",
+        "interest expense", "finance cost",
+        "other income", "total non-operating",
+        "before exceptional", "exceptional",
+        "profit before tax", "before income tax",
+        "provision for income tax", "tax expense", "current tax", "deferred tax", "income tax",
+        "equity-method", "profit after tax",
+        "profit for the year", "net income",
+        "other comprehensive", "total comprehensive",
+        "basic earnings", "diluted earnings", "earnings per share",
+    ],
+    "Balance Sheet": [
+        "cash and cash equivalent", "bank balance", "marketable securities", "current investment",
+        "inventories", "accounts receivable", "trade receivable", "other current asset",
+        "total current assets",
+        "property and equipment", "property, plant", "fixed asset", "right-of-use", "operating lease",
+        "goodwill", "intangible", "non-current investment", "deferred tax asset", "other asset",
+        "total non-current assets",
+        "total assets",
+        "accounts payable", "trade payable", "accrued", "short-term debt", "short-term borrowing",
+        "current portion", "other current liabilit", "total current liabilities",
+        "long-term debt", "long-term borrowing", "long-term lease", "lease liabilit",
+        "deferred tax liabilit", "other long-term", "other non-current liabilit",
+        "total non-current liabilities", "total liabilities",
+        "common stock", "share capital", "additional paid-in", "securities premium", "treasury stock",
+        "retained earnings", "reserves", "accumulated", "other equity",
+        "total stockholders", "total shareholders", "total equity", "total equity and liabilities",
+    ],
+    "Cash Flow Statement": [
+        "profit before tax", "net income", "profit for the year",
+        "depreciation", "amortization", "stock-based compensation", "stock based compensation",
+        "changes in", "accounts receivable", "inventories", "accounts payable",
+        "cash generated from operation", "income tax paid",
+        "net cash provided by operating", "net cash generated from operating",
+        "net cash from operating", "net cash used in operating",
+        "purchases of property", "purchase of property", "purchases of marketable", "sales and maturities",
+        "acquisitions", "purchase of investment",
+        "net cash used in investing", "net cash provided by (used in) investing",
+        "net cash from investing", "net cash generated from investing",
+        "proceeds from long-term debt", "repayments of long-term debt",
+        "proceeds from short-term", "repayments of short-term",
+        "principal repayments of finance", "principal repayments of financing", "dividend", "buyback",
+        "net cash used in financing", "net cash provided by (used in) financing", "net cash from financing",
+        "foreign currency effect", "net increase", "net decrease",
+        "cash, cash equivalents", "cash and cash equivalents",
+    ],
+}
+
+
 def _preferred_label_order(statement: str, label: str) -> tuple[int, str]:
-    order = {
-        "Income Statement": [
-            "revenue",
-            "sales",
-            "income",
-            "expense",
-            "profit before",
-            "tax",
-            "profit for",
-            "net income",
-            "comprehensive",
-            "earnings",
-        ],
-        "Balance Sheet": [
-            "asset",
-            "current asset",
-            "total assets",
-            "equity",
-            "liabilit",
-            "total equity",
-        ],
-        "Cash Flow Statement": [
-            "operating",
-            "net cash generated",
-            "net cash provided",
-            "investing",
-            "financing",
-            "cash and cash equivalents",
-        ],
-    }[statement]
+    template = _STATEMENT_ORDER.get(statement, [])
     lower = label.lower()
-    for idx, needle in enumerate(order):
-        if needle in lower:
-            return (idx, label)
-    return (99, label)
+    best_idx, best_len = None, -1
+    for idx, phrase in enumerate(template):
+        if phrase in lower and len(phrase) > best_len:
+            best_idx, best_len = idx, len(phrase)
+    if best_idx is None:
+        return (len(template) + 1, lower)
+    return (best_idx, lower)
 
 
 def _is_total_label(label: str) -> bool:
