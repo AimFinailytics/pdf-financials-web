@@ -634,8 +634,18 @@ def parse_statement_rows(
         # weighted-average share count (its parent header wraps to its own line).
         if statement_name == "Income Statement" and low_lbl in ("basic", "diluted"):
             which = "Basic" if low_lbl == "basic" else "Diluted"
-            key = f"Weighted-Avg Shares {which}"
-            display = f"Weighted-Avg Shares ({which})"
+            # A bare "Basic"/"Diluted" line is either EPS (small, often decimal)
+            # or the weighted-average share count (large whole numbers). Both can
+            # appear (e.g. Meta), so tell them apart by the values.
+            nums = [v for v in values if v is not None]
+            has_decimal = any(abs(v - round(v)) > 1e-9 for v in nums)
+            per_share = has_decimal or (nums and max(abs(v) for v in nums) < 100)
+            if per_share:
+                key = f"{which} EPS"
+                display = f"{which} Earnings per Share"
+            else:
+                key = f"Weighted-Avg Shares {which}"
+                display = f"Weighted-Avg Shares ({which})"
         elif statement_name == "Cash Flow Statement" and low_lbl in ("period", "of period"):
             # The "...beginning of period" cash line wraps so only "Period" survives.
             key = "Cash Beginning of Period"
@@ -724,9 +734,14 @@ def standardize_label(label: str, statement_name: str) -> str:
         # Canonicalize across year-to-year wording changes so the same concept
         # is ONE row (e.g. "Income (loss) before income taxes" == "Income before
         # income taxes"; "Net income (loss)" == "Net income").
-        if "before income tax" in lower or "profit before tax" in lower or "profit/(loss) before tax" in lower:
-            return "Profit Before Tax"
-        if "for income tax" in lower and ("provision" in lower or "benefit" in lower):
+        # Pre-tax income — "before" + "income tax" covers "Income (loss) before
+        # income taxes" AND "Income before provision for income taxes" (Meta).
+        if ("income tax" in lower and "before" in lower) or "profit before tax" in lower:
+            return "Income Before Income Taxes"
+        # The tax charge itself — must NOT contain "before" (else it would
+        # swallow the pre-tax line above).
+        if ("income tax" in lower and "before" not in lower
+                and ("provision" in lower or "benefit" in lower or "tax expense" in lower)):
             return "Provision for Income Taxes"
         if "technology and" in lower and ("content" in lower or "infrastructure" in lower):
             return "Technology and Infrastructure"
@@ -879,20 +894,26 @@ _AS_MED = Side(style="medium", color="FF9900")
 # Ordered sections per statement and the label keywords that fall under each.
 _SECTIONS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
     "Income Statement": [
-        ("I.  REVENUE", ("product sales", "service sales", "sale of goods", "revenue from operations",
-                         "total net sales", "total revenue", "operating revenue", "net sales", "total income")),
-        ("II. OPERATING EXPENSES", ("cost of sales", "cost of materials", "cost of goods", "purchases of stock",
-                         "changes in inventories", "fulfillment", "technology", "content", "sales and marketing",
-                         "general and administrative", "employee benefit", "depreciation", "other operating expense",
-                         "other expense", "total operating expense", "total expense")),
-        ("III. OPERATING & NON-OPERATING INCOME", ("operating income", "operating profit", "interest income",
-                         "finance income", "interest expense", "finance cost", "other income",
+        ("I.  REVENUE", ("revenue from operations", "total revenue", "net revenue", "revenue", "turnover",
+                         "product sales", "service sales", "sale of goods", "total net sales", "net sales",
+                         "operating revenue", "total income")),
+        ("II. OPERATING EXPENSES", ("cost of revenue", "cost of sales", "cost of materials", "cost of goods",
+                         "purchases of stock", "changes in inventories", "fulfillment", "research and development",
+                         "technology", "content", "marketing and sales", "sales and marketing", "selling",
+                         "general and administrative", "administrative", "employee benefit", "depreciation",
+                         "other operating expense", "other expense", "total costs and expenses", "total costs",
+                         "total operating expense", "total expense", "operating costs")),
+        ("III. OPERATING & NON-OPERATING INCOME", ("income from operations", "loss from operations",
+                         "operating income", "operating profit", "interest and other income", "interest income",
+                         "finance income", "interest expense", "finance cost", "other income", "other expense, net",
                          "total non-operating", "exceptional")),
-        ("IV. TAXES & BOTTOM LINE", ("before income tax", "before tax", "provision for income tax", "benefit",
-                         "tax expense", "current tax", "deferred tax", "income tax", "equity-method",
-                         "net income", "profit for the year", "profit after tax")),
+        ("IV. TAXES & BOTTOM LINE", ("income before", "before income tax", "before tax", "before provision",
+                         "provision for income tax", "provision for tax", "benefit", "tax expense", "current tax",
+                         "deferred tax", "income tax", "equity-method", "net income", "net loss",
+                         "profit for the year", "profit after tax")),
         ("V.  COMPREHENSIVE INCOME", ("comprehensive",)),
-        ("VI. EARNINGS PER SHARE", ("earnings per share", "per share", "weighted", "basic", "diluted")),
+        ("VI. EARNINGS PER SHARE", ("earnings per share", "per share", "weighted-average shares",
+                         "weighted-avg shares", "weighted", "basic", "diluted")),
     ],
     "Balance Sheet": [
         ("A.  CURRENT ASSETS", ("cash and cash equivalent", "bank balance", "marketable securities",
@@ -955,8 +976,10 @@ def _drop_row(label: str) -> bool:
 
 
 def _is_noise_label(label: str) -> bool:
+    # Only true fragments — keep legitimate one-word lines like "Revenue",
+    # "Goodwill", "Inventories", "Fulfillment".
     low = label.strip().lower()
-    if len(low) < 6 or len(low.split()) < 2:
+    if len(low) < 4:
         return True
     if low.endswith((" and", " - and", " -", " of", " or", ",")):
         return True
@@ -1038,15 +1061,20 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
     # group keys by section, preserving statement order within each
     sections = _SECTIONS.get(statement, [])
     buckets: dict[int, list[str]] = {i: [] for i in range(len(sections))}
-    leftovers: list[str] = []
+    last_section = 0
     for key in keys:
         label = _display_label(filings, statement, key)
         if _drop_row(label):
             continue
         idx = _classify_section(statement, label)
-        if idx < 0 and _is_noise_label(label):
-            continue  # unclassified footnote / wrapped-line fragment
-        (buckets[idx] if idx >= 0 else leftovers).append(key)
+        if idx < 0:
+            if _is_noise_label(label):
+                continue  # true footnote / wrapped-line fragment
+            idx = last_section  # inherit the running section, preserving PDF order
+        else:
+            last_section = idx
+        buckets[idx].append(key)
+    leftovers: list[str] = []
 
     row = 6
     for sec_idx, (sec_label, _) in enumerate(sections):
@@ -1140,15 +1168,20 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
 
     sections = _SECTIONS.get(statement, [])
     buckets: dict[int, list[str]] = {i: [] for i in range(len(sections))}
-    leftovers: list[str] = []
+    last_section = 0
     for key in keys:
         label = disp(key)
         if _drop_row(label):
             continue
         idx = _classify_section(statement, label)
-        if idx < 0 and _is_noise_label(label):
-            continue
-        (buckets[idx] if idx >= 0 else leftovers).append(key)
+        if idx < 0:
+            if _is_noise_label(label):
+                continue
+            idx = last_section
+        else:
+            last_section = idx
+        buckets[idx].append(key)
+    leftovers: list[str] = []
 
     def render(row: int, key: str) -> None:
         label = disp(key)
