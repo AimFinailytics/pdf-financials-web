@@ -473,8 +473,9 @@ def _find_comprehensive_page(pages: list[tuple[int, str]]) -> int | None:
         nlines = _numeric_line_count(text)
         if nlines < 3:
             continue
+        head_lines = [ln for ln in text.splitlines() if ln.strip()][:12]
         heading = max(
-            (_title_heading_score(line, _COMPREHENSIVE_PATTERNS) for line in text.splitlines()),
+            (_title_heading_score(line, _COMPREHENSIVE_PATTERNS) for line in head_lines),
             default=0,
         )
         if heading > 0 and heading * 100 + nlines > best_score:
@@ -493,9 +494,12 @@ def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, set[int]]:
         numeric_lines = _numeric_line_count(text)
         if numeric_lines < 5:  # a real statement page is dense with numbers
             continue
-        lines = text.splitlines()
+        # The real statement title sits at the TOP of the page; a stray mention
+        # in a footnote (e.g. cash-flow page referencing the balance sheet) must
+        # not win, so only the first lines count as a heading.
+        head_lines = [ln for ln in text.splitlines() if ln.strip()][:12]
         for name, patterns in _TITLE_PATTERNS.items():
-            heading = max((_title_heading_score(line, patterns) for line in lines), default=0)
+            heading = max((_title_heading_score(line, patterns) for line in head_lines), default=0)
             if heading <= 0:
                 continue
             score = heading * 100 + min(numeric_lines, 60)
@@ -598,16 +602,26 @@ def parse_statement_rows(
     rows: dict[str, dict[str, float]] = {}
     labels: dict[str, str] = {}  # canonical key -> clean display label
     order: dict[str, int] = {}   # canonical key -> first line position (PDF row order)
+    current_header = ""          # sub-section header ("Net sales:", "Cost of sales:")
 
     for idx, raw_line in enumerate(normalize_text(text).splitlines()):
         line = raw_line.strip()
         if not line or len(line) < 4:
             continue
         lower = line.lower()
-        if any(skip in lower for skip in ("see accompanying notes", "corporate overview", "statutory reports")):
-            continue
+        if any(skip in lower for skip in ("see accompanying notes", "corporate overview",
+                                          "statutory reports", "form 10-k", "form 10k", "table of contents",
+                                          "par value", "shares authorized", "shares issued",
+                                          "issued and outstanding", "shares outstanding", "respectively")):
+            continue  # share-count descriptions carry bogus numbers (authorized shares, dates)
 
         numbers = extract_numbers(line)
+        # A sub-section header ("Net sales:", "Cost of sales:", "Operating
+        # expenses:") — track it so bare lines under it (Apple "Products" /
+        # "Services") get the right context and don't collide.
+        if line.endswith(":") and not numbers:
+            current_header = re.sub(r"\s+", " ", line.rstrip(":").strip())
+            continue
         # A real statement row has exactly the period columns (allow one stray,
         # e.g. a note reference). The statement page is detected precisely, so
         # there are no footnote tables here to capture extra numbers from.
@@ -619,6 +633,13 @@ def parse_statement_rows(
         # Skip the period-header line itself ("Year Ended December 31, 2022 2023"),
         # whose "numbers" are just years/dates, not financial values.
         if re.search(_MONTH_RE, lower) and all(1900 <= abs(n) <= 2100 for n in numbers):
+            continue
+        # A date-header line whose label is ONLY month name(s) — e.g. Apple's
+        # "September 27, 2025  September 28, 2024" (the day+year merge into bogus
+        # numbers, dodging the year-range check above).
+        if re.search(_MONTH_NAMES, lower) and not re.sub(
+            _MONTH_NAMES, "", text_part, flags=re.I
+        ).strip(" ,.;:-0123456789$()"):
             continue
         if lower.startswith("year ended") or "months ended" in lower or lower.strip() in ("period", "particulars"):
             continue
@@ -650,6 +671,12 @@ def parse_statement_rows(
             # The "...beginning of period" cash line wraps so only "Period" survives.
             key = "Cash Beginning of Period"
             display = "Cash, Cash Equivalents & Restricted Cash, Beginning of Period"
+        elif (low_lbl in ("products", "product", "services", "service", "goods", "equipment", "software")
+              and "cost" in current_header.lower()):
+            # Apple lists "Products"/"Services" under BOTH "Net sales:" and
+            # "Cost of sales:" — keep the cost ones distinct from the revenue ones.
+            key = standardize_label(f"Cost of Sales {raw_label}", statement_name)
+            display = f"{clean_label(raw_label)} (Cost of Sales)"
         else:
             key = standardize_label(raw_label, statement_name)  # merge key only
             if not key or len(key) < 3:
@@ -803,10 +830,11 @@ def title_company(value: str) -> str:
 
 _SMALL_WORDS = {"of", "and", "the", "for", "to", "in", "on", "a", "an", "or",
                 "per", "by", "with", "from", "as", "at"}
-_MONTH_RE = (
-    r"(january|february|march|april|may|june|july|august|september|october|"
-    r"november|december)\s+\d{1,2}"
+_MONTH_NAMES = (
+    r"(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)"
 )
+_MONTH_RE = _MONTH_NAMES + r"\s+\d{1,2}"
 
 
 def clean_label(label: str) -> str:
