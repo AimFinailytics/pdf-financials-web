@@ -236,6 +236,9 @@ def parse_pdf(path: Path) -> ParsedPdf:
             scan_pages = _scan_text_pdfium(path)
             statement_pages = find_statement_pages(scan_pages)
             needed = {p for page_set in statement_pages.values() for p in page_set}
+            comp_page = _find_comprehensive_page(scan_pages)
+            if comp_page:
+                needed.add(comp_page)
             precise = _extract_pages_pdfplumber(path, needed)
         except Exception as exc:
             return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
@@ -254,6 +257,7 @@ def parse_pdf(path: Path) -> ParsedPdf:
         except Exception as exc:
             return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
         statement_pages = find_statement_pages(pages)
+        comp_page = _find_comprehensive_page(pages)
     statement_preview = "\n".join(
         text
         for page_no, text in pages
@@ -281,6 +285,23 @@ def parse_pdf(path: Path) -> ParsedPdf:
             parsed.statements[statement_name] = rows
             parsed.display_labels[statement_name] = labels
             parsed.row_order[statement_name] = order
+
+    # Fold the separate Comprehensive Income statement's two summary lines into
+    # the Income Statement's Comprehensive Income section.
+    if comp_page is not None and "Income Statement" in parsed.statements:
+        comp_text = next((t for pn, t in pages if pn == comp_page), "")
+        if comp_text:
+            cperiods = detect_periods(comp_text, "Income Statement") or _dedupe(all_periods)
+            crows, clabels, corder = parse_statement_rows(comp_text, cperiods, "Income Statement")
+            is_rows = parsed.statements["Income Statement"]
+            is_labels = parsed.display_labels["Income Statement"]
+            is_order = parsed.row_order["Income Statement"]
+            base = (max(is_order.values()) if is_order else 0) + 1000
+            for key in crows:
+                if "comprehensive" in clabels.get(key, "").lower():
+                    is_rows[key] = crows[key]
+                    is_labels[key] = clabels[key]
+                    is_order[key] = base + corder.get(key, 0)
 
     parsed.periods = _dedupe_periods(all_periods)
     if not parsed.periods:
@@ -438,6 +459,29 @@ def _numeric_line_count(text: str) -> int:
     return count
 
 
+_COMPREHENSIVE_PATTERNS = (r"consolidated statements? of comprehensive income",)
+
+
+def _find_comprehensive_page(pages: list[tuple[int, str]]) -> int | None:
+    """The standalone 'Consolidated Statements of Comprehensive Income' page
+    (a separate statement in US 10-Ks), whose two summary lines we fold into the
+    Income Statement's Comprehensive Income section."""
+    best_score, best_page = 0, None
+    for page_no, text in pages:
+        if any(marker in text.lower() for marker in _PAGE_EXCLUDE_MARKERS):
+            continue
+        nlines = _numeric_line_count(text)
+        if nlines < 3:
+            continue
+        heading = max(
+            (_title_heading_score(line, _COMPREHENSIVE_PATTERNS) for line in text.splitlines()),
+            default=0,
+        )
+        if heading > 0 and heading * 100 + nlines > best_score:
+            best_score, best_page = heading * 100 + nlines, page_no
+    return best_page
+
+
 def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, set[int]]:
     found = {name: set() for name in STATEMENTS}
     best: dict[str, tuple[int, int | None]] = {name: (0, None) for name in STATEMENTS}
@@ -581,16 +625,25 @@ def parse_statement_rows(
 
         values = numbers[:period_count] if statement_name == "Balance Sheet" else numbers[-period_count:]
         raw_label = re.sub(r"\s+", " ", text_part).strip(" -:;*")
-        key = standardize_label(raw_label, statement_name)  # merge key only
-        if not key or len(key) < 3:
-            continue
-        if re.fullmatch(r"[ivxlcdm.\s()-]+", key.lower()):
-            continue
+        low_lbl = raw_label.lower()
+        # In the income statement a lone "Basic"/"Diluted" line is the
+        # weighted-average share count (its parent header wraps to its own line).
+        if statement_name == "Income Statement" and low_lbl in ("basic", "diluted"):
+            which = "Basic" if low_lbl == "basic" else "Diluted"
+            key = f"Weighted-Avg Shares {which}"
+            display = f"Weighted-Avg Shares ({which})"
+        else:
+            key = standardize_label(raw_label, statement_name)  # merge key only
+            if not key or len(key) < 3:
+                continue
+            if re.fullmatch(r"[ivxlcdm.\s()-]+", key.lower()):
+                continue
+            display = clean_label(raw_label)  # polished Title Case for display
 
         if not periods:
             periods = [f"Period {i + 1}" for i in range(period_count)]
         rows[key] = {period: value for period, value in zip(periods[-len(values) :], values)}
-        labels[key] = clean_label(raw_label)  # polished Title Case for display
+        labels[key] = display
         order.setdefault(key, idx)
 
     return rows, labels, order
@@ -603,7 +656,8 @@ def normalize_text(text: str) -> str:
     text = text.replace("—", "-").replace("–", "-")
     text = re.sub(r"(?<=\d)\s*,\s*(?=\d)", ",", text)
     text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
-    text = re.sub(r"(?<=\d)\s+(?=\d,\d{3})", "", text)
+    # NOTE: do NOT collapse "989 2,949" -> "9892,949"; a space before a 4-digit
+    # "X,XXX" thousands value is a column break, not a split single number.
     text = re.sub(r"(\.\d{2})(?=\d{1,3},\d{3}\.\d{2})", r"\1 ", text)
     return text
 
@@ -668,6 +722,10 @@ def standardize_label(label: str, statement_name: str) -> str:
             return "Provision for Income Taxes"
         if "technology and" in lower and ("content" in lower or "infrastructure" in lower):
             return "Technology and Infrastructure"
+        if "total other comprehensive" in lower or ("other comprehensive" in lower and "total" in lower):
+            return "Total Other Comprehensive Income"
+        if "comprehensive income" in lower:
+            return "Comprehensive Income"
         if (
             "profit for the year" in lower
             or "net income" in lower
@@ -681,6 +739,11 @@ def standardize_label(label: str, statement_name: str) -> str:
         # "... non-marketable investments, and other"); collapse to one row.
         if "acquisitions" in lower and "net of cash acquired" in lower:
             return "Acquisitions, Net of Cash Acquired, and Other"
+        # The reconciling adjustment for "Other income (expense), net" is reworded
+        # across years ("Other operating expense (income), net", "Non-operating
+        # expense (income), net" …) — collapse to one operating-section row.
+        if "expense (income), net" in lower:
+            return "Other Expense (Income), Net (Adj.)"
 
     replacements = {
         "total revenue from operations": "Revenue from Operations",
@@ -843,7 +906,7 @@ _SECTIONS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
     "Cash Flow Statement": [
         ("A.  OPERATING ACTIVITIES", ("net income", "profit before tax", "profit for the year", "depreciation",
                          "amortization", "stock-based compensation", "deferred income tax", "non-operating expense",
-                         "working capital", "changes in", "accounts receivable", "inventories", "accounts payable",
+                         "expense (income), net", "working capital", "changes in", "accounts receivable", "inventories", "accounts payable",
                          "accrued", "unearned", "other assets", "cash generated from operation", "income tax paid",
                          "operating lease assets", "net cash provided by operating", "net cash generated from operating",
                          "net cash from operating", "net cash used in operating", "net cash provided by (used in) operating")),
@@ -874,7 +937,7 @@ def _classify_section(statement: str, label: str) -> int:
     return best_idx
 
 
-_DROP_LABELS = {"basic", "diluted", "period", "marketing", "december", "particulars",
+_DROP_LABELS = {"period", "marketing", "december", "particulars",
                 "issued shares - and", "outstanding shares - and"}
 
 

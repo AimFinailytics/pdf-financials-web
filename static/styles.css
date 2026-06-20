@@ -45,7 +45,9 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   padding: 20px clamp(20px, 5vw, 60px);
 }
-.brand { display: flex; align-items: center; gap: 14px; }
+.brand { display: flex; align-items: center; gap: 14px; text-decoration: none; cursor: pointer; transition: transform 0.15s ease; }
+.brand:hover { transform: translateY(-1px); }
+.brand:hover .brand-mark { box-shadow: 0 10px 26px -8px rgba(10, 168, 103, 0.6); }
 .brand-mark {
   width: 52px; height: 52px; border-radius: 14px; object-fit: cover;
   box-shadow: 0 8px 22px -8px rgba(6, 59, 119, 0.6);
