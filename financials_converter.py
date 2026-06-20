@@ -623,6 +623,10 @@ def parse_statement_rows(
         if lower.startswith("year ended") or "months ended" in lower or lower.strip() in ("period", "particulars"):
             continue
 
+        # Drop a single leading note-reference (small integer) when it shows up
+        # as one extra number, e.g. Indian "3  1,13,114  1,60,281".
+        if len(numbers) == period_count + 1 and abs(numbers[0]) < 100 and numbers[0] == int(numbers[0]):
+            numbers = numbers[1:]
         values = numbers[:period_count] if statement_name == "Balance Sheet" else numbers[-period_count:]
         raw_label = re.sub(r"\s+", " ", text_part).strip(" -:;*")
         low_lbl = raw_label.lower()
@@ -632,6 +636,10 @@ def parse_statement_rows(
             which = "Basic" if low_lbl == "basic" else "Diluted"
             key = f"Weighted-Avg Shares {which}"
             display = f"Weighted-Avg Shares ({which})"
+        elif statement_name == "Cash Flow Statement" and low_lbl in ("period", "of period"):
+            # The "...beginning of period" cash line wraps so only "Period" survives.
+            key = "Cash Beginning of Period"
+            display = "Cash, Cash Equivalents & Restricted Cash, Beginning of Period"
         else:
             key = standardize_label(raw_label, statement_name)  # merge key only
             if not key or len(key) < 3:
@@ -663,11 +671,11 @@ def normalize_text(text: str) -> str:
 
 
 def extract_numbers(line: str) -> list[float]:
+    # A standalone dash is a zero placeholder ("repurchased  —  (6,000)  —").
+    line = re.sub(r"(?<=\s)[-–—](?=\s|$)", "0", line)
     matches = re.findall(r"\(?-?\d[\d,]*(?:\.\d+)?\)?", line)
     values: list[float] = []
     for token in matches:
-        if re.fullmatch(r"\d{1,2}", token):
-            continue
         negative = token.startswith("(") and token.endswith(")")
         clean = token.strip("()").replace(",", "")
         try:
@@ -937,7 +945,7 @@ def _classify_section(statement: str, label: str) -> int:
     return best_idx
 
 
-_DROP_LABELS = {"period", "marketing", "december", "particulars",
+_DROP_LABELS = {"marketing", "december", "particulars",
                 "issued shares - and", "outstanding shares - and"}
 
 
@@ -967,17 +975,23 @@ def _is_subtotal(label: str) -> bool:
     }
 
 
+def _number_format(label: str) -> str:
+    # Per-share figures keep 2 decimals; everything else is a whole-number punch.
+    return "#,##0.00;(#,##0.00)" if "per share" in label.lower() else "#,##0;(#,##0)"
+
+
 def _as_row(ws, row, label, vals, indent=0, total=False, ncols=0):
     fill = _AS_TOTAL if total else (_AS_ALT if row % 2 == 0 else _AS_WHITE)
     font = _AS_SEC_FONT if total else _AS_NORM_FONT
     border = Border(top=_AS_THIN, bottom=_AS_MED) if total else Border(bottom=_AS_THIN)
+    numfmt = _number_format(label)
     c1 = ws.cell(row, 1, "    " * indent + label)
     c1.fill, c1.font, c1.border = fill, font, border
     c1.alignment = Alignment(horizontal="left", vertical="center")
     for i, val in enumerate(vals, 2):
         c = ws.cell(row, i, val)
         c.fill, c.font, c.border = fill, font, border
-        c.number_format = "#,##0"
+        c.number_format = numfmt
         c.alignment = Alignment(horizontal="right", vertical="center")
 
 
@@ -1142,13 +1156,14 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
         fill = _AS_TOTAL if total else (_AS_ALT if row % 2 == 0 else _AS_WHITE)
         font = _AS_SEC_FONT if total else _AS_NORM_FONT
         border = Border(top=_AS_THIN, bottom=_AS_MED) if total else Border(bottom=_AS_THIN)
+        numfmt = _number_format(label)
         c1 = ws.cell(row, 1, ("" if total else "    ") + label)
         c1.fill, c1.font, c1.border = fill, font, border
         c1.alignment = Alignment(horizontal="left", vertical="center")
         for company, period, ccol in plan:
             c = ws.cell(row, ccol, _value_for_period(grouped[company], statement, key, period))
             c.fill, c.font, c.border = fill, font, border
-            c.number_format = "#,##0"
+            c.number_format = numfmt
             c.alignment = Alignment(horizontal="right", vertical="center")
 
     row = 5
