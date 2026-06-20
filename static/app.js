@@ -8,7 +8,6 @@ const resultsPanel = document.getElementById("resultsPanel");
 const outputCount = document.getElementById("outputCount");
 const downloads = document.getElementById("downloads");
 const skipped = document.getElementById("skipped");
-const summaryGrid = document.getElementById("summaryGrid");
 
 function iconRefresh() {
   if (window.lucide) {
@@ -55,11 +54,6 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function formatNumber(value) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
-  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
 function renderResults(data) {
   resultsPanel.hidden = false;
   downloads.innerHTML = "";
@@ -70,7 +64,7 @@ function renderResults(data) {
     row.className = "download-row";
     row.innerHTML = `
       <a href="${file.url}">
-        <i data-lucide="${file.name.endsWith(".zip") ? "package" : "sheet"}"></i>
+        <i data-lucide="${file.name.endsWith(".zip") ? "package" : "file-spreadsheet"}"></i>
         <span>${escapeHtml(file.name)}</span>
       </a>
       <span>${formatBytes(file.size)}</span>
@@ -86,39 +80,7 @@ function renderResults(data) {
     skipped.innerHTML = "";
   }
 
-  renderSummaries(data.summaries || {});
   iconRefresh();
-}
-
-function renderSummaries(summaries) {
-  summaryGrid.innerHTML = "";
-  for (const [company, metrics] of Object.entries(summaries)) {
-    const periods = Array.from(
-      new Set(Object.values(metrics).flatMap((periodMap) => Object.keys(periodMap)))
-    ).sort();
-
-    const card = document.createElement("article");
-    card.className = "summary-card";
-    const rows = Object.entries(metrics)
-      .map(([metric, periodMap]) => {
-        const cells = periods.map((period) => `<td>${formatNumber(periodMap[period])}</td>`).join("");
-        return `<tr><td>${escapeHtml(metric)}</td>${cells}</tr>`;
-      })
-      .join("");
-
-    card.innerHTML = `
-      <div class="summary-title"><h3>${escapeHtml(company)}</h3></div>
-      <div class="summary-table-wrap">
-        <table>
-          <thead>
-            <tr><th>Metric</th>${periods.map((period) => `<th>${escapeHtml(period)}</th>`).join("")}</tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    `;
-    summaryGrid.appendChild(card);
-  }
 }
 
 fileInput.addEventListener("change", renderFiles);
@@ -155,7 +117,6 @@ form.addEventListener("submit", async (event) => {
   button.disabled = true;
   setStatus("Processing", "busy");
   resultsPanel.hidden = true;
-  summaryGrid.innerHTML = "";
 
   try {
     const response = await fetch("/api/convert", {

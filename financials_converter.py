@@ -159,7 +159,7 @@ def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path) -> ConversionResul
         output_paths.append(out_path)
         summaries[company] = build_summary(company, filings)
 
-    if len(valid) >= 2:
+    if len(grouped) >= 2:  # a master only makes sense across 2+ distinct companies
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         master_path = output_dir / f"MASTER_Consolidated_FS_{timestamp}.xlsx"
         build_master_workbook(grouped, master_path)
