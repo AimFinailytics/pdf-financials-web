@@ -4,10 +4,8 @@ openpyxl>=3.1
 Werkzeug>=3.0
 gunicorn>=21.2
 pypdfium2>=4.30
-# Email storage (Google Sheets). Optional at runtime — app degrades to a local
-# CSV if these aren't configured.
-gspread>=6.0
-google-auth>=2.30
+# Email storage posts to a Google Form (-> linked Sheet) using only the stdlib —
+# no extra packages needed.
 # Opt-in AI-assisted extraction (free Google AI Studio / Gemini Flash tier).
 # Optional at runtime — only imported when a user enables AI assist.
 google-genai>=1.0

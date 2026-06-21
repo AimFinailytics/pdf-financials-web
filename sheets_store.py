@@ -1,72 +1,57 @@
 """Email-signup storage.
 
-Primary store is a Google Sheet (so Manas gets a live, exportable mailing list).
-It is intentionally resilient: if Google Sheets isn't configured or the API call
-fails for any reason, signups are still captured in a local CSV so the gate keeps
-working and no email is ever lost. Nothing here ever raises into the request path.
+Signups are sent to a Google Form (published, "Anyone with the link", email
+collection OFF), which writes every submission to its linked Google Sheet — that
+Sheet is the mailing list. This needs NO credentials on the server: it's a plain
+HTTPS POST to the form's public formResponse endpoint.
 
-Configure the Google Sheet via two environment variables:
-  GOOGLE_SERVICE_ACCOUNT_JSON  -> the full service-account JSON (one line), OR a
-                                  path to the .json file on disk.
-  SHEET_ID                     -> the target spreadsheet's ID (from its URL).
-Share the spreadsheet with the service account's client_email (Editor) first.
+It is intentionally resilient: signups are also mirrored to a local CSV, so if the
+form POST ever fails the email is still captured. Nothing here raises into the
+request path.
+
+Configure via environment variables (set on Render):
+  FORM_POST_URL     -> the form's .../formResponse URL
+  FORM_EMAIL_ENTRY  -> the email field id, e.g. "entry.906489358"
+  FORM_NAME_ENTRY   -> the name field id,  e.g. "entry.659201863"  (optional)
 """
 
 from __future__ import annotations
 
 import csv
-import json
 import os
 import threading
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_CSV = BASE_DIR / "signups.csv"
 _HEADERS = ["timestamp_utc", "email", "name", "ip", "user_agent"]
-
-# gspread worksheet handle is cached after first successful connect.
 _lock = threading.Lock()
-_worksheet = None
-_sheets_tried = False
 
 
-def _get_worksheet():
-    """Lazily connect to the Google Sheet. Returns a gspread worksheet or None.
-    Cached so we don't re-auth on every signup. Never raises."""
-    global _worksheet, _sheets_tried
-    if _worksheet is not None:
-        return _worksheet
-    if _sheets_tried:
-        return None  # already failed once; don't hammer the API every request
-    _sheets_tried = True
-
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    sheet_id = os.environ.get("SHEET_ID", "").strip()
-    if not raw or not sheet_id:
-        return None
+def _post_to_form(email: str, name: str) -> bool:
+    """POST one signup to the Google Form. Returns True on success. Never raises."""
+    url = os.environ.get("FORM_POST_URL", "").strip()
+    email_entry = os.environ.get("FORM_EMAIL_ENTRY", "").strip()
+    if not url or not email_entry:
+        return False
+    fields = {email_entry: email}
+    name_entry = os.environ.get("FORM_NAME_ENTRY", "").strip()
+    if name_entry and name:
+        fields[name_entry] = name
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-
-        if raw.startswith("{"):
-            info = json.loads(raw)
-        else:  # treat as a path to the JSON file
-            info = json.loads(Path(raw).read_text(encoding="utf-8"))
-
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(sheet_id)
-        ws = sheet.sheet1
-        # Ensure a header row exists.
-        if not ws.row_values(1):
-            ws.append_row(_HEADERS, value_input_option="RAW")
-        _worksheet = ws
-        return _worksheet
+        data = urllib.parse.urlencode(fields).encode()
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status == 200
     except Exception as exc:  # noqa: BLE001 — never break the request path
-        print(f"[sheets_store] Google Sheets unavailable, using local CSV: {exc}")
-        return None
+        print(f"[sheets_store] form POST failed, using local CSV only: {exc}")
+        return False
 
 
 def _append_local_csv(row: list[str]) -> None:
@@ -82,24 +67,16 @@ def _append_local_csv(row: list[str]) -> None:
 
 
 def record_signup(email: str, name: str = "", ip: str = "", user_agent: str = "") -> bool:
-    """Append a signup. Returns True if stored anywhere. Never raises."""
+    """Append a signup to the Google Form (-> Sheet) and mirror to local CSV.
+    Returns True if stored anywhere. Never raises."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     row = [ts, email, name, ip, user_agent[:300]]
-    stored = False
     with _lock:
-        ws = _get_worksheet()
-        if ws is not None:
-            try:
-                ws.append_row(row, value_input_option="RAW")
-                stored = True
-            except Exception as exc:  # noqa: BLE001
-                print(f"[sheets_store] append failed, falling back to CSV: {exc}")
-        # Always mirror to the local CSV too — cheap, and a safety net.
-        _append_local_csv(row)
-        stored = True
-    return stored
+        _post_to_form(email, name)        # the durable mailing list
+        _append_local_csv(row)            # local safety-net mirror
+    return True
 
 
 def storage_mode() -> str:
-    """For diagnostics: 'google-sheets' when the Sheet is reachable, else 'local-csv'."""
-    return "google-sheets" if _get_worksheet() is not None else "local-csv"
+    """For diagnostics: 'google-form' when the form POST is configured, else 'local-csv'."""
+    return "google-form" if os.environ.get("FORM_POST_URL", "").strip() else "local-csv"
