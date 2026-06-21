@@ -93,14 +93,32 @@ SUMMARY_LABELS = {
         "total revenue from operations",
         "net sales",
     ),
-    "PBT": ("profit before tax", "income before income taxes", "before income taxes"),
-    "PAT": ("profit for the year", "net income", "net profit for the"),
+    # Covers profit- and loss-making wording, US and Indian.
+    "PBT": (
+        "profit before tax", "loss before tax", "profit/(loss) before tax",
+        "income before income taxes", "before income taxes", "before tax",
+    ),
+    "PAT": (
+        "profit for the year", "loss for the year", "profit for the period",
+        "loss for the period", "profit/(loss) for the", "net income",
+        "net profit for the", "net profit/(loss)",
+    ),
     "Total Assets": ("total assets",),
     "Total Equity": ("total equity", "total stockholders' equity", "total shareholders' equity"),
+    # Many Indian reports word the net operating line differently ("Net cash
+    # inflow from … operating activities", "Net cash flows generated from …").
     "Operating Cash Flow": (
         "net cash generated from operating activities",
         "net cash provided by operating activities",
         "net cash provided by (used in) operating activities",
+        "net cash flows generated from operating activities",
+        "net cash flow from operating activities",
+        "net cash flows from operating activities",
+        "net cash from operating activities",
+        "net cash inflow from",
+        "net cash used in operating activities",
+        "net cash generated from",  # "...from / (Used In) Operating Activities (A)"
+        "operating activities (a)",  # Indian net-operating lines suffix the section "(A)"
     ),
 }
 
@@ -127,9 +145,9 @@ class ConversionResult:
     skipped: list[str]
 
 
-def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path) -> ConversionResult:
+def convert_pdfs(pdf_paths: Iterable[Path], output_dir: Path, use_ai: bool = False) -> ConversionResult:
     output_dir.mkdir(parents=True, exist_ok=True)
-    parsed = [parse_pdf(Path(path)) for path in pdf_paths]
+    parsed = [parse_pdf(Path(path), use_ai=use_ai) for path in pdf_paths]
 
     valid = [item for item in parsed if not item.skipped_reason]
     skipped = [
@@ -218,12 +236,62 @@ def _extract_pages_pdfplumber(path: Path, page_numbers: set[int]) -> dict[int, s
         for i, page in enumerate(pdf.pages):
             page_no = i + 1
             if page_no in page_numbers:
-                result[page_no] = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                result[page_no] = _extract_page_columns(page)
             page.flush_cache()
     return result
 
 
-def parse_pdf(path: Path) -> ParsedPdf:
+def _extract_page_columns(page) -> str:
+    """Extract a page's text, handling the side-by-side two-statement layout common
+    in Indian reports (e.g. Balance Sheet on the left half, Statement of Profit and
+    Loss on the right half). A plain top-to-bottom read interleaves the two columns
+    ("Right-of-Use Asset" + "II Expenses" -> garbage); when we detect two statement
+    titles sitting side by side, we crop the page at the gutter and read the left
+    column fully, then the right column fully."""
+    base = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+    # Cheap gate: only statement-ish pages are worth the geometry work.
+    low = base.lower()
+    if not any(s in low for s in ("balance sheet", "profit and loss", "cash flow",
+                                  "statement of operations", "statement of income",
+                                  "comprehensive income", "financial position")):
+        return base
+    try:
+        words = page.extract_words(x_tolerance=1, y_tolerance=3)
+    except Exception:
+        return base
+    if len(words) < 30:
+        return base
+    width = float(page.width)
+    # Find a clean vertical GUTTER in the central band that no word crosses, with
+    # numeric content AND row-start labels on BOTH sides — the signature of two
+    # statements printed side by side (Balance Sheet | Profit & Loss).
+    has_digit = re.compile(r"\d")
+    has_alpha = re.compile(r"[A-Za-z]")
+    split_x = None
+    lo, hi = width * 0.40, width * 0.60
+    steps = 24
+    for k in range(steps + 1):
+        sx = lo + k * (hi - lo) / steps
+        if any(float(w["x0"]) < sx < float(w["x1"]) for w in words):
+            continue  # a word crosses here -> not a gutter
+        left_nums = sum(1 for w in words if float(w["x1"]) <= sx and has_digit.search(w["text"]))
+        right_nums = sum(1 for w in words if float(w["x0"]) >= sx and has_digit.search(w["text"]))
+        # the right table must start its own labels just past the gutter
+        right_labels = sum(
+            1 for w in words
+            if sx <= float(w["x0"]) < sx + width * 0.18 and has_alpha.search(w["text"])
+        )
+        if left_nums >= 6 and right_nums >= 6 and right_labels >= 4:
+            split_x = sx
+            break
+    if split_x is None:
+        return base  # single column / stacked — the line-span logic handles it
+    left = page.crop((0, 0, split_x, page.height)).extract_text(x_tolerance=1, y_tolerance=3) or ""
+    right = page.crop((split_x, 0, width, page.height)).extract_text(x_tolerance=1, y_tolerance=3) or ""
+    return left + "\n" + right
+
+
+def parse_pdf(path: Path, use_ai: bool = False) -> ParsedPdf:
     try:
         page_count = _pdf_page_count(path)
     except Exception:
@@ -234,23 +302,35 @@ def parse_pdf(path: Path) -> ParsedPdf:
         # deep-parse only those few pages with pdfplumber for accurate numbers.
         try:
             scan_pages = _scan_text_pdfium(path)
-            statement_pages = find_statement_pages(scan_pages)
-            needed = {p for page_set in statement_pages.values() for p in page_set}
+            scan_spans = find_statement_pages(scan_pages)
             comp_page = _find_comprehensive_page(scan_pages)
+            # Deep-parse the chosen statement pages plus their immediate neighbours
+            # (continuation pages, combined-statement neighbours) and the
+            # comprehensive-income page, so the final text is precise everywhere
+            # the numbers come from.
+            needed: set[int] = set()
+            for spans in scan_spans.values():
+                for (p, _s, _e) in spans:
+                    needed.update({p - 1, p, p + 1})
             if comp_page:
                 needed.add(comp_page)
+            needed = {p for p in needed if p >= 1}
             precise = _extract_pages_pdfplumber(path, needed)
         except Exception as exc:
             return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
-        # Use precise pdfplumber text on statement pages; the cheap scan text on
-        # the rest (only consumed for company-name detection / preview).
+        # Precise text on statement pages; cheap scan text elsewhere.
         pages = [(page_no, precise.get(page_no, text)) for page_no, text in scan_pages]
+        # Keep the scan's (correct) page+statement choices, but recompute the span
+        # line-indices on the precise text (cheap scan can paginate differently).
+        # NOTE: do NOT re-run the full selector here — it would re-pick the cluster
+        # on mixed precise/scan text and can land on the wrong one.
+        statement_pages = _spans_on_precise(scan_spans, dict(pages))
     else:
         try:
             with pdfplumber.open(path) as pdf:
                 pages = []
                 for i, page in enumerate(pdf.pages):
-                    text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                    text = _extract_page_columns(page)
                     pages.append((i + 1, text))
                     # Release pdfplumber's cached layout objects for this page.
                     page.flush_cache()
@@ -258,11 +338,13 @@ def parse_pdf(path: Path) -> ParsedPdf:
             return ParsedPdf("Unknown Company", path.name, path, skipped_reason=f"could not read PDF ({exc})")
         statement_pages = find_statement_pages(pages)
         comp_page = _find_comprehensive_page(pages)
-    statement_preview = "\n".join(
-        text
-        for page_no, text in pages
-        if any(page_no in page_set for page_set in statement_pages.values())
-    )
+
+    page_text = dict(pages)
+    # Company detection reads the WHOLE chosen statement pages (their header
+    # carries "<Company> and Subsidiaries"), not the sliced spans — the span
+    # starts at the statement title, below that header line.
+    chosen_pages = sorted({p for spans in statement_pages.values() for (p, _s, _e) in spans})
+    statement_preview = "\n".join(page_text.get(p, "") for p in chosen_pages)
     joined_first_pages = "\n".join(text for _, text in pages[:12])
     company = detect_company(statement_preview) or detect_company(joined_first_pages) or path.stem
 
@@ -273,8 +355,8 @@ def parse_pdf(path: Path) -> ParsedPdf:
     parsed.statements = {}
 
     all_periods: list[str] = []
-    for statement_name, page_numbers in statement_pages.items():
-        statement_text = "\n".join(text for page_no, text in pages if page_no in page_numbers)
+    for statement_name, spans in statement_pages.items():
+        statement_text = _span_text(page_text, spans)
         periods = detect_periods(statement_text, statement_name)
         if not periods:
             periods = detect_periods(joined_first_pages + "\n" + statement_text, statement_name)
@@ -307,10 +389,61 @@ def parse_pdf(path: Path) -> ParsedPdf:
     if not parsed.periods:
         parsed.periods = _infer_periods_from_rows(parsed.statements)
 
+    # Opt-in AI assist: only when the user enabled it AND the deterministic parse
+    # is weak (a statement missing or too few rows). Sends just the detected
+    # statement-page text to the free Gemini tier and merges any extra lines.
+    if use_ai and _parse_confidence(parsed) < 3:
+        statement_texts = {
+            name: _span_text(page_text, spans)
+            for name, spans in statement_pages.items()
+            if spans
+        }
+        _apply_ai_fallback(parsed, statement_texts)
+
     if not parsed.statements:
         parsed.skipped_reason = "consolidated statement pages found but no rows could be parsed"
 
     return parsed
+
+
+def _parse_confidence(parsed: ParsedPdf) -> int:
+    """How many of the 3 statements parsed with a usable number of rows.
+    3 = all good; lower means the deterministic pass likely missed something."""
+    good = 0
+    for statement in STATEMENTS:
+        rows = parsed.statements.get(statement, {})
+        if len(rows) >= 4:
+            good += 1
+    return good
+
+
+def _apply_ai_fallback(parsed: ParsedPdf, statement_texts: dict[str, str]) -> None:
+    """Merge Gemini-extracted rows into `parsed`, filling statements/lines the
+    deterministic parser missed. Never overwrites already-parsed rows. No-op if
+    AI isn't configured or returns nothing."""
+    try:
+        import gemini_fallback
+    except Exception:
+        return
+    ai = gemini_fallback.extract(statement_texts, parsed.periods)
+    if not ai:
+        return
+    ai_periods = ai.get("periods") or []
+    for period in ai_periods:
+        if period not in parsed.periods:
+            parsed.periods.append(period)
+    for statement, payload in ai.get("statements", {}).items():
+        rows = parsed.statements.setdefault(statement, {})
+        labels = parsed.display_labels.setdefault(statement, {})
+        order = parsed.row_order.setdefault(statement, {})
+        base = (max(order.values()) if order else 0) + 1
+        for key, values in payload.get("rows", {}).items():
+            if key in rows:  # trust the on-server deterministic value first
+                continue
+            rows[key] = values
+            labels[key] = payload.get("labels", {}).get(key, key.title())
+            order[key] = base + payload.get("order", {}).get(key, 0)
+    parsed.periods = _dedupe_periods(parsed.periods)
 
 
 def detect_company(text: str) -> str | None:
@@ -363,8 +496,11 @@ def detect_company(text: str) -> str | None:
         if annual_report_match:
             return title_company(annual_report_match.group(1).strip(" -.,"))
 
+        # A standalone company line, e.g. "BRITANNIA INDUSTRIES LIMITED" at the
+        # top of a SEBI quarterly results page. \b after the suffix stops "income"
+        # from matching "Inc".
         exact_company = re.search(
-            r"^([A-Z][A-Z0-9&.,'() -]{3,}?(?:LIMITED|LTD\.?|INC\.?|CORPORATION|COMPANY|PLC))\s*$",
+            r"^([A-Z][A-Z0-9&.,'() -]{3,}?(?:LIMITED|LTD\.?|INC\.?|CORPORATION|COMPANY|PLC))\b\s*$",
             line.strip(),
             flags=re.I,
         )
@@ -379,13 +515,19 @@ def detect_company(text: str) -> str | None:
     if members_match:
         return title_company(members_match.group(1).strip(" -.,"))
 
+    # \b after the suffix prevents matching "Interest inc-ome", "...company-wide",
+    # etc. — the suffix must be a whole word.
     generic_match = re.search(
-        r"([A-Z][A-Z0-9&.,'() -]{3,}?(?:LIMITED|LTD\.?|INC\.?|CORPORATION|COMPANY|PLC))",
+        r"([A-Z][A-Za-z0-9&.,'() -]{3,}?(?:LIMITED|LTD\.?|INC\.?|CORPORATION|COMPANY|PLC))\b",
         normalized,
         flags=re.I,
     )
     if generic_match:
-        return title_company(generic_match.group(1).strip(" -.,"))
+        candidate = generic_match.group(1).strip(" -.,")
+        # Guard against a lowercase-prose false positive ("... the company")
+        # by requiring the matched span to contain an uppercase anchor.
+        if re.search(r"[A-Z]{2,}", candidate) or candidate.istitle():
+            return title_company(candidate)
     return None
 
 
@@ -436,6 +578,9 @@ def _title_heading_score(line: str, patterns: tuple[str, ...]) -> int:
     stripped = re.sub(r"\s+", " ", line).strip().lower().rstrip(".")
     if not stripped or len(stripped) > 90:
         return 0
+    # 10-Q / interim statements are titled "Condensed Consolidated Statements of
+    # Income" etc. Drop a leading qualifier so the title still matches.
+    stripped = re.sub(r"^(?:unaudited\s+|condensed\s+|interim\s+)+", "", stripped)
     for pat in patterns:
         match = re.match(rf"{pat}\b", stripped)
         if not match:
@@ -483,10 +628,19 @@ def _find_comprehensive_page(pages: list[tuple[int, str]]) -> int | None:
     return best_page
 
 
-def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, set[int]]:
-    found = {name: set() for name in STATEMENTS}
-    best: dict[str, tuple[int, int | None]] = {name: (0, None) for name in STATEMENTS}
+# A span is (page_no, start_line, end_line) into that page's text — so a page that
+# packs two statements (e.g. an Indian "Balance Sheet" + "Statement of Profit and
+# Loss" on one sheet) can be split between them.
+Span = tuple[int, int, int]
 
+
+def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, list[Span]]:
+    page_text = {pno: txt for pno, txt in pages}
+
+    # 1) Collect every clean statement-title heading ANYWHERE on each dense page
+    #    (not just the top), with its line index — this catches combined pages.
+    candidates: dict[str, list[tuple]] = {name: [] for name in STATEMENTS}
+    titles_on_page: dict[int, list[tuple[int, str]]] = {}
     for page_no, text in pages:
         lower = text.lower()
         if any(marker in lower for marker in _PAGE_EXCLUDE_MARKERS):
@@ -494,52 +648,138 @@ def find_statement_pages(pages: list[tuple[int, str]]) -> dict[str, set[int]]:
         numeric_lines = _numeric_line_count(text)
         if numeric_lines < 5:  # a real statement page is dense with numbers
             continue
-        # The real statement title sits at the TOP of the page; a stray mention
-        # in a footnote (e.g. cash-flow page referencing the balance sheet) must
-        # not win, so only the first lines count as a heading.
-        head_lines = [ln for ln in text.splitlines() if ln.strip()][:12]
-        for name, patterns in _TITLE_PATTERNS.items():
-            heading = max((_title_heading_score(line, patterns) for line in head_lines), default=0)
-            if heading <= 0:
+        lines = text.splitlines()
+        page_titles: list[tuple[int, str]] = []
+        for i, line in enumerate(lines):
+            if not line.strip():
                 continue
-            score = heading * 100 + min(numeric_lines, 60)
-            if score > best[name][0]:
-                best[name] = (score, page_no)
+            for name, patterns in _TITLE_PATTERNS.items():
+                heading = _title_heading_score(line, patterns)
+                if heading <= 0:
+                    continue
+                is_cons = "consolidated" in line.lower()
+                score = heading * 100 + min(numeric_lines, 60) + (60 if is_cons else 0)
+                candidates[name].append((page_no, i, score, is_cons))
+                page_titles.append((i, name))
+                break
+        if page_titles:
+            titles_on_page[page_no] = sorted(page_titles)
 
-    for name, (_, page_no) in best.items():
-        if page_no is not None:
-            found[name].add(page_no)
+    if not any(candidates.values()):
+        return {name: [] for name in STATEMENTS}
 
-    # A statement can spill onto the following page (cash-flow financing section,
-    # balance-sheet equity half). Include the next page when it continues the
-    # table and is not itself another statement's title page.
-    page_text = {pno: txt for pno, txt in pages}
+    # 2) Indian reports carry BOTH standalone and consolidated statements; pick the
+    #    CONSOLIDATED set. More generally, find the densest cluster — the anchor
+    #    page near which the most distinct statements have a candidate (US 10-K
+    #    statements span a few pages; Indian ones sit together / on one page).
+    doc_has_consolidated = any(c[3] for cl in candidates.values() for c in cl)
+    all_pages = sorted({c[0] for cl in candidates.values() for c in cl})
+
+    def cluster_quality(anchor: int) -> tuple:
+        lo, hi = anchor - 3, anchor + 6
+        names, total, cons = set(), 0, 0
+        for name, cl in candidates.items():
+            near = [c for c in cl if lo <= c[0] <= hi and (c[3] or not doc_has_consolidated)]
+            if near:
+                names.add(name)
+                best = max(near, key=lambda c: c[2])
+                total += best[2]
+                cons += 1 if best[3] else 0
+        return (len(names), cons, total)
+
+    anchor = max(all_pages, key=cluster_quality)
+    lo, hi = anchor - 3, anchor + 6
+
+    # 3) Assign each statement its best candidate inside the cluster window,
+    #    preferring consolidated; fall back to global best if none nearby.
+    chosen: dict[str, tuple[int, int]] = {}
+    for name, cl in candidates.items():
+        near = [c for c in cl if lo <= c[0] <= hi]
+        pool = near or cl
+        if doc_has_consolidated and any(c[3] for c in pool):
+            pool = [c for c in pool if c[3]]
+        if pool:
+            best = max(pool, key=lambda c: c[2])
+            chosen[name] = (best[0], best[1])
+
+    # 4) Build spans, ending each statement at the NEXT title on its page (so a
+    #    combined Balance-Sheet + P&L page is split cleanly between them).
+    spans: dict[str, list[Span]] = {name: [] for name in STATEMENTS}
+    for name, (page_no, line_idx) in chosen.items():
+        n_lines = len(page_text[page_no].splitlines())
+        # End at the next DIFFERENT statement's title (a repeated same-statement
+        # title is just a header reprint, e.g. Paytm prints the P&L title twice).
+        following = [li for li, nm in titles_on_page.get(page_no, []) if li > line_idx and nm != name]
+        end = min(following) if following else n_lines
+        spans[name].append((page_no, line_idx, end))
+
+    # 5) Continuation: a statement that runs to the bottom of its page can spill
+    #    onto the next (cash-flow financing tail, balance-sheet equity half).
     for name in ("Cash Flow Statement", "Balance Sheet"):
-        for page_no in list(found[name]):
+        for (page_no, _start, end) in list(spans[name]):
+            if end < len(page_text[page_no].splitlines()):
+                continue  # ended mid-page (a combined page) -> no spill
             nxt = page_text.get(page_no + 1, "")
-            if not nxt:
+            if not nxt or _numeric_line_count(nxt) < 5:
                 continue
-            if any(
-                _title_heading_score(line, pats)
-                for pats in _TITLE_PATTERNS.values()
-                for line in nxt.splitlines()
-            ):
+            if page_no + 1 in titles_on_page:  # next page begins a new statement
                 continue
             low = nxt.lower()
-            if _numeric_line_count(nxt) < 5:
-                continue
             if name == "Cash Flow Statement":
                 keys = ("financing activities", "net cash", "cash and cash equivalents", "continued")
-                if any(key in low for key in keys):
-                    found[name].add(page_no + 1)
-            else:  # Balance Sheet — only the Indian two-page (assets | equity+liabilities) split,
-                   # never the separate Statement of Stockholders' Equity roll-forward.
+                if any(k in low for k in keys):
+                    spans[name].append((page_no + 1, 0, len(nxt.splitlines())))
+            else:
                 if "stockholders" in low and "equity" in low and "statement" in low:
                     continue
                 keys = ("total equity and liabilities", "total liabilities and equity", "continued")
-                if any(key in low for key in keys):
-                    found[name].add(page_no + 1)
-    return found
+                if any(k in low for k in keys):
+                    spans[name].append((page_no + 1, 0, len(nxt.splitlines())))
+    return spans
+
+
+def _span_text(page_text: dict[int, str], spans: list[Span]) -> str:
+    """Concatenate the line-ranges for a statement's spans into one text block."""
+    parts = []
+    for (page_no, start, end) in spans:
+        lines = page_text.get(page_no, "").splitlines()
+        parts.append("\n".join(lines[start:end]))
+    return "\n".join(parts)
+
+
+def _titles_on(text: str) -> list[tuple[int, str]]:
+    """Line index + statement name for every clean statement-title heading in a
+    page's text (used to recompute spans on precise text)."""
+    out: list[tuple[int, str]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        for name, patterns in _TITLE_PATTERNS.items():
+            if _title_heading_score(line, patterns) > 0:
+                out.append((i, name))
+                break
+    return sorted(out)
+
+
+def _spans_on_precise(scan_spans: dict[str, list[Span]], page_text: dict[int, str]) -> dict[str, list[Span]]:
+    """Re-locate each scan-chosen span on the precise (pdfplumber) text, keeping
+    the scan's page+statement decision but fixing line indices to the precise
+    pagination. Splits a combined page at the next different-statement title."""
+    titles = {p: _titles_on(page_text.get(p, "")) for sp in scan_spans.values() for (p, _s, _e) in sp}
+    out: dict[str, list[Span]] = {name: [] for name in STATEMENTS}
+    for name, spans in scan_spans.items():
+        for (page_no, s_scan, _e_scan) in spans:
+            n_lines = len(page_text.get(page_no, "").splitlines())
+            page_titles = titles.get(page_no, [])
+            same = [li for li, nm in page_titles if nm == name]
+            if same:  # title page: start at this statement's title (nearest scan pos)
+                start = min(same, key=lambda li: abs(li - s_scan))
+            else:  # continuation page (scan start was 0) or title not re-found
+                start = 0
+            following = [li for li, nm in page_titles if li > start and nm != name]
+            end = min(following) if following else n_lines
+            out[name].append((page_no, start, end))
+    return out
 
 
 def detect_periods(text: str, statement_name: str) -> list[str]:
@@ -551,45 +791,59 @@ def detect_periods(text: str, statement_name: str) -> list[str]:
         if len(dated_years) >= 2:
             return [f"FY{year}" for year in _dedupe(dated_years[-2:])]
 
-    for idx, line in enumerate(lines[:20]):
-        if "year ended december 31" in line.lower():
-            window = " ".join(lines[idx : idx + 3])
-            years = re.findall(r"\b(20\d{2})\b", window)
-            if years:
-                return [f"FY{year}" for year in _dedupe(years)]
+    # Month names AND abbreviations (NVIDIA's FY ends "Jan 25, 2026"; Indian
+    # reports use "March 31, 2025"). "sept" tolerated.
+    months = (r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*")
+    header = lines[:16]  # the statement title + column-header block
 
-    # A column header anchored on a month/day date — "December 31," or
-    # "As at March 31, 2023" — possibly with the years on the next line. Grab the
-    # years from a short window. Covers US balance sheets and Indian statements
-    # whose period wording isn't "year ended". (normalize_text can fuse the date
-    # line and year line, so search a window rather than a single line.)
-    month = r"(january|february|march|april|may|june|july|august|september|october|november|december)"
-    for idx, line in enumerate(lines[:20]):
-        if re.search(rf"{month}\s+\d{{1,2}}", line.lower()):
-            window = " ".join(lines[idx : idx + 3])
-            years = re.findall(r"\b(20\d{2})\b", window)
-            if years:
-                return [f"FY{year}" for year in _dedupe(years)]
-
-    date_patterns = [
-        r"\b\d{1,2}\s+(?:March|Mar|December|Dec)\s+(20\d{2})\b",
-        r"\b(?:March|Mar|December|Dec)\s+\d{1,2},?\s+(20\d{2})\b",
-        r"\b\d{1,2}[./-]\d{1,2}[./-](20\d{2})\b",
-    ]
+    # 1) Years embedded directly in a dated column header — "<Month> <day>, <year>"
+    #    or "<day> <Month> <year>" or "31/03/2025". Collect across the header block
+    #    in reading order (left->right / top->bottom matches the value columns).
     years: list[str] = []
-    header = "\n".join(lines[:30])
-    period_search_space = normalized if statement_name == "Cash Flow Statement" else header
-    for pattern in date_patterns:
-        years.extend(re.findall(pattern, period_search_space, flags=re.I))
+    for line in header:
+        low = line.lower()
+        for m in re.finditer(rf"{months}\.?\s+\d{{1,2}},?\s*(20\d{{2}})", low):
+            years.append(m.group(1))
+        for m in re.finditer(rf"\d{{1,2}}\s+{months}\.?\s*,?\s*(20\d{{2}})", low):
+            years.append(m.group(1))
+        for m in re.finditer(r"\b\d{1,2}[./-]\d{1,2}[./-](20\d{2})\b", low):
+            years.append(m.group(1))
     years = _dedupe(years)
 
+    # 2) US style where the date label and the year row are SEPARATE lines
+    #    ("Year Ended December 31," then "2023 2024 2025"). Grab years from a small
+    #    window anchored on the date/period phrase.
+    if len(years) < 2:
+        for idx, line in enumerate(header):
+            low = line.lower()
+            if ("year ended" in low or "as at" in low or "as of" in low
+                    or "december 31" in low or re.search(rf"{months}\.?\s+\d{{1,2}}", low)):
+                window = " ".join(header[idx : idx + 3])
+                w = _dedupe(re.findall(r"\b(20\d{2})\b", window))
+                if len(w) > len(years):
+                    years = w
+                if len(years) >= 2:
+                    break
+
+    # 3) A standalone row of bare years ("2023 2024 2025").
+    if len(years) < 2:
+        for line in header:
+            if re.fullmatch(r"(?:20\d{2}\s*){2,6}", line.strip()):
+                years = re.findall(r"20\d{2}", line)
+                break
+
+    # 4) Last resort: any single year in the header block.
     if not years:
-        bare_year_lines = [line for line in lines[:15] if re.fullmatch(r"(?:20\d{2}\s*){2,4}", line)]
-        if bare_year_lines:
-            years = re.findall(r"20\d{2}", bare_year_lines[0])
+        for line in header:
+            found = re.findall(r"\b20\d{2}\b", line)
+            if found:
+                years = _dedupe(found)
+                break
 
     if statement_name == "Balance Sheet" and len(years) > 2:
-        years = years[-2:]
+        years = years[:2]  # US/Indian balance sheets show 2 columns (current, prior)
+    if len(years) > 6:
+        years = years[:6]
 
     return [f"FY{year}" for year in years]
 
@@ -616,6 +870,11 @@ def parse_statement_rows(
             continue  # share-count descriptions carry bogus numbers (authorized shares, dates)
 
         numbers = extract_numbers(line)
+        # A date-column header whose day+year fused into a 6-digit "DDYYYY" token
+        # ("March 31, 2025" -> 312025; NVIDIA "Jan 25, 2026" -> 252026). If every
+        # number on the line decodes to a valid date, it's a header, not a row.
+        if numbers and all(_is_date_encoded(n) for n in numbers):
+            continue
         # A sub-section header ("Net sales:", "Cost of sales:", "Operating
         # expenses:") — track it so bare lines under it (Apple "Products" /
         # "Services") get the right context and don't collide.
@@ -642,6 +901,14 @@ def parse_statement_rows(
         ).strip(" ,.;:-0123456789$()"):
             continue
         if lower.startswith("year ended") or "months ended" in lower or lower.strip() in ("period", "particulars"):
+            continue
+        # Indian date-column headers ("For the year ended March 31, 2025",
+        # "As at March 31, 2025", "As of December 31,") whose day+year fuse into a
+        # bogus number like 312025 — always a header, never a line item.
+        if (("for the year ended" in lower or "for the period ended" in lower
+                or "for the quarter ended" in lower or lower.startswith("as at")
+                or lower.startswith("as of") or lower.startswith("particulars"))
+                and re.search(_MONTH_NAMES, lower)):
             continue
 
         # Drop a single leading note-reference (small integer) when it shows up
@@ -705,6 +972,19 @@ def normalize_text(text: str) -> str:
     # "X,XXX" thousands value is a column break, not a split single number.
     text = re.sub(r"(\.\d{2})(?=\d{1,3},\d{3}\.\d{2})", r"\1 ", text)
     return text
+
+
+def _is_date_encoded(n: float) -> bool:
+    """True if n is a 6-digit 'DDYYYY' date token produced when a column header's
+    day and year fuse — e.g. 'March 31, 2025' -> 312025, 'Jan 25, 2026' -> 252026.
+    Used to drop date-header lines that masquerade as data rows."""
+    if n != int(n):
+        return False
+    n = abs(int(n))
+    if 10100 <= n <= 312099:
+        day, year = divmod(n, 10000)
+        return 1 <= day <= 31 and 2000 <= year <= 2099
+    return False
 
 
 def extract_numbers(line: str) -> list[float]:
@@ -820,10 +1100,22 @@ def standardize_label(label: str, statement_name: str) -> str:
 
 def title_company(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip()
+    # Indian reports place the auditor firm + "Chartered Accountants" immediately
+    # before the company name in the signature/audit block — keep only the part
+    # after the LAST "Chartered Accountants".
+    matches = list(re.finditer(r"chartered accountants", value, flags=re.I))
+    if matches:
+        value = value[matches[-1].end():].strip(" -.,")
+    # Drop a leading "for and on behalf of the Board of Directors of" connective.
+    value = re.sub(
+        r"^for\s+and\s+on\s+behalf\s+of\s+the\s+board\s+of\s+directors\s+of\s+",
+        "", value, flags=re.I,
+    ).strip()
+    # Trim any leading non-letter noise (stray numbers/parens that the greedy
+    # company-suffix regex swept in, e.g. Techno's "(1,64,049.12) 20,454.15 ...").
+    value = re.sub(r"^[^A-Za-z]+", "", value).strip()
     if value.isupper():
         value = value.title()
-    value = value.replace("Limited", "Limited").replace("Inc.", "Inc.")
-    value = value.replace("Britannia Industries Limited", "Britannia Industries Limited")
     value = value.replace("Amazon.Com", "Amazon.com")
     return value
 

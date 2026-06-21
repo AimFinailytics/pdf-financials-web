@@ -8,6 +8,13 @@ const resultsPanel = document.getElementById("resultsPanel");
 const outputCount = document.getElementById("outputCount");
 const downloads = document.getElementById("downloads");
 const skipped = document.getElementById("skipped");
+const useAi = document.getElementById("useAi");
+
+const signupOverlay = document.getElementById("signupOverlay");
+const signupForm = document.getElementById("signupForm");
+const signupEmail = document.getElementById("signupEmail");
+const signupName = document.getElementById("signupName");
+const signupError = document.getElementById("signupError");
 
 function iconRefresh() {
   if (window.lucide) {
@@ -20,6 +27,57 @@ function setStatus(text, kind = "") {
   statusPill.className = `status-pill ${kind}`.trim();
 }
 
+/* ---------- signup gate ---------- */
+function showGate() {
+  signupOverlay.hidden = false;
+  document.body.classList.add("gated");
+  iconRefresh();
+  setTimeout(() => signupEmail && signupEmail.focus(), 50);
+}
+
+function hideGate() {
+  signupOverlay.hidden = true;
+  document.body.classList.remove("gated");
+}
+
+async function checkAccess() {
+  try {
+    const res = await fetch("/api/me");
+    const data = await res.json();
+    if (!data.signed_up) showGate();
+  } catch (_) {
+    /* if the check fails, let them try — convert will re-gate if needed */
+  }
+}
+
+if (signupForm) {
+  signupForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    signupError.hidden = true;
+    const email = (signupEmail.value || "").trim();
+    if (!email) {
+      signupError.textContent = "Please enter your email.";
+      signupError.hidden = false;
+      return;
+    }
+    try {
+      const res = await fetch("/api/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, name: (signupName.value || "").trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Signup failed");
+      hideGate();
+      setStatus("Ready", "");
+    } catch (err) {
+      signupError.textContent = err.message;
+      signupError.hidden = false;
+    }
+  });
+}
+
+/* ---------- file picker ---------- */
 function renderFiles() {
   const files = Array.from(fileInput.files || []);
   fileList.innerHTML = "";
@@ -113,6 +171,7 @@ form.addEventListener("submit", async (event) => {
   for (const file of files) {
     payload.append("files", file);
   }
+  payload.append("use_ai", useAi && useAi.checked ? "1" : "0");
 
   button.disabled = true;
   setStatus("Processing", "busy");
@@ -124,6 +183,11 @@ form.addEventListener("submit", async (event) => {
       body: payload,
     });
     const data = await response.json();
+    if (response.status === 403 && data.code === "signup_required") {
+      setStatus("Sign up to continue", "error");
+      showGate();
+      return;
+    }
     if (!response.ok) {
       throw new Error(data.error || "Conversion failed");
     }
@@ -140,4 +204,7 @@ form.addEventListener("submit", async (event) => {
 });
 
 renderFiles();
-window.addEventListener("load", iconRefresh);
+window.addEventListener("load", () => {
+  iconRefresh();
+  checkAccess();
+});

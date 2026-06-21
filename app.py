@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import re
 import time
 import zipfile
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file, session
 from werkzeug.utils import secure_filename
 
+import sheets_store
 from financials_converter import cleanup_dir, convert_pdfs, create_processing_dir
 
 
@@ -19,12 +20,16 @@ OUTPUT_ROOT = BASE_DIR / "outputs"
 ALLOWED_EXTENSIONS = {".pdf"}
 
 # How long a generated Excel output is kept before being swept off disk.
-# Long enough for a user to download right after converting; short enough that
-# the ephemeral disk doesn't fill up over time.
 OUTPUT_TTL_SECONDS = int(os.environ.get("OUTPUT_TTL_SECONDS", str(6 * 60 * 60)))
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 250 * 1024 * 1024
+# Stable secret so the signup cookie survives restarts/redeploys. Set
+# FLASK_SECRET_KEY in production; the dev fallback keeps local runs working.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "aimfiinsight-dev-secret-change-me")
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 365  # remember signup ~1yr
 
 
 def purge_old_outputs() -> None:
@@ -41,6 +46,13 @@ def purge_old_outputs() -> None:
             pass
 
 
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -52,11 +64,47 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.get("/api/me")
+def me():
+    """Lets the frontend know on load whether this visitor has already signed up,
+    so it can show the converter directly instead of the signup gate."""
+    return jsonify({
+        "signed_up": bool(session.get("signed_up")),
+        "email": session.get("email", ""),
+    })
+
+
+@app.post("/api/signup")
+def signup():
+    data = request.get_json(silent=True) or request.form
+    email = (data.get("email") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    if not EMAIL_RE.match(email):
+        return jsonify({"error": "Please enter a valid email address."}), 400
+
+    sheets_store.record_signup(
+        email=email,
+        name=name,
+        ip=_client_ip(),
+        user_agent=request.headers.get("User-Agent", ""),
+    )
+    session.permanent = True
+    session["signed_up"] = True
+    session["email"] = email
+    return jsonify({"ok": True, "email": email})
+
+
 @app.post("/api/convert")
 def convert():
+    # One-time email signup gates the converter.
+    if not session.get("signed_up"):
+        return jsonify({"error": "Please sign up with your email first.", "code": "signup_required"}), 403
+
     files = request.files.getlist("files")
     if not files:
         return jsonify({"error": "Upload at least one PDF."}), 400
+
+    use_ai = str(request.form.get("use_ai", "")).lower() in {"1", "true", "yes", "on"}
 
     purge_old_outputs()
 
@@ -82,7 +130,7 @@ def convert():
             cleanup_dir(output_dir)
             return jsonify({"error": "No valid PDF files were uploaded."}), 400
 
-        result = convert_pdfs(pdf_paths, output_dir)
+        result = convert_pdfs(pdf_paths, output_dir, use_ai=use_ai)
 
         downloadable = []
         for path in result.output_paths:

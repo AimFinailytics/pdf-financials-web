@@ -3,3 +3,11 @@ outputs/
 __pycache__/
 *.pyc
 .venv/
+.env
+signups.csv
+service-account*.json
+_testpdfs/
+_baseline_test.py
+server.log
+_gemini_route_test.py
+_out/

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AimFiinsight · Financial Statement Converter</title>
+    <title>AimFiinsight · Annual Report → Excel Converter</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -34,10 +34,16 @@
         <span class="hero-eyebrow">PDF → CONSOLIDATED FINANCIALS → EXCEL</span>
         <h1>Annual reports, turned into clean Excel models.</h1>
         <p>
-          Drop one or many annual-report PDFs. AimFiinsight detects the consolidated statements,
-          stacks every year side by side, and exports an institutional-grade, sectioned workbook —
-          Income Statement, Balance Sheet &amp; Cash Flow.
+          Drop one or many annual or quarterly report PDFs. AimFiinsight detects the consolidated
+          statements, stacks every year side by side, and exports an institutional-grade, sectioned
+          workbook — Income Statement, Balance Sheet &amp; Cash Flow.
         </p>
+        <div class="trust-row">
+          <span class="trust-badge"><i data-lucide="shield-check"></i> No data stored</span>
+          <span class="trust-badge"><i data-lucide="lock"></i> Fully confidential</span>
+          <span class="trust-badge"><i data-lucide="server"></i> Processed on our server</span>
+          <span class="trust-badge gold"><i data-lucide="gift"></i> Free for everyone</span>
+        </div>
       </section>
 
       <section class="workspace">
@@ -46,7 +52,7 @@
             <input id="fileInput" name="files" type="file" accept="application/pdf,.pdf" multiple />
             <div class="dz-icon"><i data-lucide="file-up"></i></div>
             <div class="dz-text">
-              <strong>Drop annual report PDFs here</strong>
+              <strong>Drop annual / quarterly report PDFs here</strong>
               <span>or <u>browse files</u> · multi-year, multi-company supported</span>
             </div>
           </div>
@@ -54,6 +60,14 @@
           <div class="file-strip" id="fileList">
             <span class="empty">No PDFs selected yet</span>
           </div>
+
+          <label class="ai-toggle" for="useAi">
+            <input type="checkbox" id="useAi" name="use_ai" />
+            <span class="ai-toggle-text">
+              <strong><i data-lucide="sparkles"></i> AI-assisted extraction</strong>
+              <small>Optional. Only used if a report is hard to parse. Sends the statement text to a secure AI service. Leave off to keep everything 100% on our server.</small>
+            </span>
+          </label>
 
           <button class="primary-action" id="convertButton" type="submit">
             <i data-lucide="sparkles"></i>
@@ -70,12 +84,58 @@
           <div class="skipped" id="skipped" hidden></div>
         </section>
       </section>
+
+      <!-- Donation / support -->
+      <section class="card donate-panel">
+        <div class="donate-copy">
+          <span class="donate-eyebrow"><i data-lucide="heart-handshake"></i> Support AimFiinsight</span>
+          <h2>This tool is free — forever.</h2>
+          <p>
+            We built this so anyone can turn a financial report into a clean Excel model in seconds,
+            with no paywall. If it saved you time, you're welcome to support our work with a small
+            contribution. Every bit helps us keep it free and improve it.
+          </p>
+          <ul class="donate-points">
+            <li><i data-lucide="check"></i> No subscription, no usage limits</li>
+            <li><i data-lucide="check"></i> Your reports are never stored</li>
+            <li><i data-lucide="check"></i> Donations are 100% optional</li>
+          </ul>
+          <div class="pay-logos">UPI · GPay · PhonePe · Paytm · BHIM</div>
+        </div>
+        <div class="donate-qr">
+          <img
+            src="{{ url_for('static', filename='img/donate-qr.png') }}"
+            alt="Scan to donate to AimFiinsight"
+            onerror="this.closest('.donate-qr').classList.add('no-qr')"
+          />
+          <div class="qr-fallback">Donation QR — add <code>static/img/donate-qr.png</code></div>
+          <span class="donate-scan"><i data-lucide="scan-line"></i> Scan to donate any amount</span>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
       <span>© AimFiinsight · Financial Intelligence</span>
       <span class="dot">•</span>
-      <span>Consolidated statements only · figures as reported</span>
+      <span>Consolidated statements only · figures as reported · no data stored</span>
     </footer>
+
+    <!-- Signup gate -->
+    <div class="signup-overlay" id="signupOverlay" hidden>
+      <div class="signup-card">
+        <img src="{{ url_for('static', filename='img/aimfiinsight-logo.png') }}" alt="AimFiinsight" class="signup-logo" />
+        <h2>Get free access</h2>
+        <p>Enter your email once to unlock the converter. It's free, unlimited, and your reports are never stored.</p>
+        <form id="signupForm">
+          <input type="text" id="signupName" name="name" placeholder="Your name (optional)" autocomplete="name" />
+          <input type="email" id="signupEmail" name="email" placeholder="you@company.com" autocomplete="email" required />
+          <button type="submit" class="primary-action">
+            <i data-lucide="unlock"></i><span>Unlock free access</span>
+          </button>
+          <p class="signup-error" id="signupError" hidden></p>
+        </form>
+        <span class="signup-fineprint"><i data-lucide="shield-check"></i> We only store your email to keep you posted. No spam.</span>
+      </div>
+    </div>
   </body>
 </html>
