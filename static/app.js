@@ -41,12 +41,15 @@ function hideGate() {
 }
 
 async function checkAccess() {
+  // The gate shows by default (markup), so a new visitor always sees it even if
+  // this check is slow/fails. Here we only DISMISS it for someone already signed
+  // up so returning users skip straight to the converter.
   try {
     const res = await fetch("/api/me");
     const data = await res.json();
-    if (!data.signed_up) showGate();
+    if (data.signed_up) hideGate();
   } catch (_) {
-    /* if the check fails, let them try — convert will re-gate if needed */
+    /* leave the gate up; signing up again just re-captures the email */
   }
 }
 

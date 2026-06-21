@@ -15,7 +15,7 @@
     <script defer src="https://unpkg.com/lucide@latest"></script>
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
   </head>
-  <body>
+  <body class="gated">
     <div class="bg-orbs" aria-hidden="true"><span></span><span></span><span></span></div>
 
     <header class="site-header">
@@ -103,13 +103,18 @@
           <div class="pay-logos">UPI · GPay · PhonePe · Paytm · BHIM</div>
         </div>
         <div class="donate-qr">
-          <img
-            src="{{ url_for('static', filename='img/donate-qr.png') }}"
-            alt="Scan to donate to AimFiinsight"
-            onerror="this.closest('.donate-qr').classList.add('no-qr')"
-          />
+          <div class="qr-frame">
+            <span class="qr-corner tl"></span><span class="qr-corner tr"></span>
+            <span class="qr-corner bl"></span><span class="qr-corner br"></span>
+            <img
+              src="{{ url_for('static', filename='img/donate-qr.png') }}"
+              alt="Scan to pay AimFiinsight via UPI"
+              onerror="this.closest('.donate-qr').classList.add('no-qr')"
+            />
+          </div>
           <div class="qr-fallback">Donation QR — add <code>static/img/donate-qr.png</code></div>
-          <span class="donate-scan"><i data-lucide="scan-line"></i> Scan to donate any amount</span>
+          <span class="donate-scan"><i data-lucide="scan-line"></i> Scan with any UPI app · pay any amount</span>
+          <span class="donate-upi"><i data-lucide="badge-indian-rupee"></i> UJJBB59991788911@Ujjivan</span>
         </div>
       </section>
     </main>
@@ -121,7 +126,7 @@
     </footer>
 
     <!-- Signup gate -->
-    <div class="signup-overlay" id="signupOverlay" hidden>
+    <div class="signup-overlay" id="signupOverlay">
       <div class="signup-card">
         <img src="{{ url_for('static', filename='img/aimfiinsight-logo.png') }}" alt="AimFiinsight" class="signup-logo" />
         <h2>Get free access</h2>
