@@ -389,16 +389,17 @@ def parse_pdf(path: Path, use_ai: bool = False) -> ParsedPdf:
     if not parsed.periods:
         parsed.periods = _infer_periods_from_rows(parsed.statements)
 
-    # Opt-in AI assist: only when the user enabled it AND the deterministic parse
-    # is weak (a statement missing or too few rows). Sends just the detected
-    # statement-page text to the free Gemini tier and merges any extra lines.
-    if use_ai and _parse_confidence(parsed) < 3:
+    # AI-assisted extraction: when the user enables it, the LLM does the FULL
+    # structuring (the way the manual "A2E" process does), replacing the
+    # deterministic rows with its clean line items. This is the path to top
+    # quality on tricky / dense reports.
+    if use_ai:
         statement_texts = {
             name: _span_text(page_text, spans)
             for name, spans in statement_pages.items()
             if spans
         }
-        _apply_ai_fallback(parsed, statement_texts)
+        _apply_ai_full(parsed, statement_texts)
 
     if not parsed.statements:
         parsed.skipped_reason = "consolidated statement pages found but no rows could be parsed"
@@ -444,6 +445,29 @@ def _apply_ai_fallback(parsed: ParsedPdf, statement_texts: dict[str, str]) -> No
             labels[key] = payload.get("labels", {}).get(key, key.title())
             order[key] = base + payload.get("order", {}).get(key, 0)
     parsed.periods = _dedupe_periods(parsed.periods)
+
+
+def _apply_ai_full(parsed: ParsedPdf, statement_texts: dict[str, str]) -> None:
+    """REPLACE each statement with the LLM's full clean extraction (the A2E-style
+    path). Falls back to the deterministic rows for any statement the AI returns
+    nothing for. No-op if AI isn't configured or returns nothing at all."""
+    try:
+        import gemini_fallback
+    except Exception:
+        return
+    ai = gemini_fallback.extract(statement_texts, parsed.periods)
+    if not ai:
+        return  # keep the deterministic result if AI unavailable/failed
+    ai_periods = [p for p in (ai.get("periods") or []) if p]
+    if ai_periods:
+        parsed.periods = _dedupe_periods(ai_periods + parsed.periods)
+    for statement, payload in ai.get("statements", {}).items():
+        rows = payload.get("rows", {})
+        if not rows:  # AI gave nothing for this statement -> keep deterministic
+            continue
+        parsed.statements[statement] = rows
+        parsed.display_labels[statement] = payload.get("labels", {})
+        parsed.row_order[statement] = payload.get("order", {})
 
 
 def detect_company(text: str) -> str | None:

@@ -87,12 +87,17 @@ def extract(statement_texts: dict[str, str], periods: list[str]) -> dict | None:
         client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
         model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
         prompt = _PROMPT.format(periods=", ".join(periods) or "none detected", body=body[:120_000])
+        # thinking_budget=0 turns off the model's slow "thinking" pass — this is a
+        # structured-extraction task, not reasoning, so it cuts latency ~5-10x.
+        cfg_kwargs = dict(temperature=0, response_mime_type="application/json")
+        try:
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass  # older SDK / model without thinking config — ignore
         resp = client.models.generate_content(
             model=model_name,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0, response_mime_type="application/json"
-            ),
+            config=types.GenerateContentConfig(**cfg_kwargs),
         )
         raw = (resp.text or "").strip()
         data = _loads_lenient(raw)
