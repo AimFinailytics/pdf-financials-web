@@ -394,12 +394,21 @@ def parse_pdf(path: Path, use_ai: bool = False) -> ParsedPdf:
     # deterministic rows with its clean line items. This is the path to top
     # quality on tricky / dense reports.
     if use_ai:
-        statement_texts = {
-            name: _span_text(page_text, spans)
-            for name, spans in statement_pages.items()
-            if spans
-        }
-        _apply_ai_full(parsed, statement_texts)
+        # Hand the LLM the WHOLE statement-region pages (not the narrow detected
+        # spans) so it can find statements the detector mis-assigned and read
+        # messy / multi-column / digit-split tables itself — the A2E approach.
+        # Cap the page span so a stray detection can't balloon the request.
+        span_pages = sorted({p for spans in statement_pages.values() for (p, _s, _e) in spans})
+        if comp_page:
+            span_pages = sorted(set(span_pages + [comp_page]))
+        if span_pages and (span_pages[-1] - span_pages[0]) <= 12:
+            lo, hi = span_pages[0] - 1, span_pages[-1] + 1
+            region = [page_text[p] for p in range(lo, hi + 1) if p in page_text]
+        else:  # detections too far apart — fall back to the per-statement spans
+            region = [_span_text(page_text, s) for s in statement_pages.values() if s]
+        blob = "\n\n".join(t for t in region if t)
+        if blob.strip():
+            _apply_ai_full(parsed, {"Statements": blob})
 
     if not parsed.statements:
         parsed.skipped_reason = "consolidated statement pages found but no rows could be parsed"
