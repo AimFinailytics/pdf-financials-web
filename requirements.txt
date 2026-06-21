@@ -6,6 +6,7 @@ gunicorn>=21.2
 pypdfium2>=4.30
 # Email storage posts to a Google Form (-> linked Sheet) using only the stdlib —
 # no extra packages needed.
-# Opt-in AI-assisted extraction (free Google AI Studio / Gemini Flash tier).
-# Optional at runtime — only imported when a user enables AI assist.
+# AI-assisted extraction. Claude (Anthropic) is the preferred engine — it is the
+# "A2E" gold standard — with Gemini as a fallback. Both optional at runtime.
+anthropic>=0.40
 google-genai>=1.0

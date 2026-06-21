@@ -458,13 +458,21 @@ def _apply_ai_fallback(parsed: ParsedPdf, statement_texts: dict[str, str]) -> No
 
 def _apply_ai_full(parsed: ParsedPdf, statement_texts: dict[str, str]) -> None:
     """REPLACE each statement with the LLM's full clean extraction (the A2E-style
-    path). Falls back to the deterministic rows for any statement the AI returns
-    nothing for. No-op if AI isn't configured or returns nothing at all."""
+    path). Prefers the Claude API (the A2E gold standard); falls back to Gemini,
+    then to the deterministic rows. No-op if no AI is configured."""
+    ai = None
     try:
-        import gemini_fallback
+        import claude_extractor
+        if claude_extractor.is_configured():
+            ai = claude_extractor.extract(statement_texts, parsed.periods)
     except Exception:
-        return
-    ai = gemini_fallback.extract(statement_texts, parsed.periods)
+        ai = None
+    if ai is None:
+        try:
+            import gemini_fallback
+            ai = gemini_fallback.extract(statement_texts, parsed.periods)
+        except Exception:
+            ai = None
     if not ai:
         return  # keep the deterministic result if AI unavailable/failed
     ai_periods = [p for p in (ai.get("periods") or []) if p]
