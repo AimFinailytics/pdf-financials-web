@@ -10,4 +10,4 @@ gspread>=6.0
 google-auth>=2.30
 # Opt-in AI-assisted extraction (free Google AI Studio / Gemini Flash tier).
 # Optional at runtime — only imported when a user enables AI assist.
-google-generativeai>=0.8
+google-genai>=1.0

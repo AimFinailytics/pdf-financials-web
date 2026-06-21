@@ -9,7 +9,7 @@ structured line items that get merged back into the workbook builder.
 
 Configure with one environment variable:
   GEMINI_API_KEY   -> a free key from https://aistudio.google.com/apikey
-  GEMINI_MODEL     -> optional, defaults to "gemini-2.0-flash" (most generous free tier)
+  GEMINI_MODEL     -> optional, defaults to "gemini-2.5-flash" (free-tier Flash model)
 
 If the key or library is absent, every function here degrades to a no-op (returns
 None), so the app runs perfectly fine without AI configured.
@@ -81,15 +81,18 @@ def extract(statement_texts: dict[str, str], periods: list[str]) -> dict | None:
         return None
 
     try:
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
 
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"].strip())
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
-        model = genai.GenerativeModel(model_name)
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
         prompt = _PROMPT.format(periods=", ".join(periods) or "none detected", body=body[:120_000])
-        resp = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0, "response_mime_type": "application/json"},
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0, response_mime_type="application/json"
+            ),
         )
         raw = (resp.text or "").strip()
         data = _loads_lenient(raw)
