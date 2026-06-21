@@ -1,0 +1,22 @@
+name: keep-warm
+# Render's free tier spins the service down after ~15 min idle, causing a slow
+# (~40s) cold start on the next visit. Ping /health every 10 minutes to keep it
+# warm so real visitors never hit a cold start.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -m 60 -o /dev/null -w "%{http_code}" https://pdf-financials-web.onrender.com/health || true)
+            echo "attempt $i -> HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 20
+          done
+          echo "health did not return 200 after retries (service may be waking)"
