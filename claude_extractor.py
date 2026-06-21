@@ -83,12 +83,9 @@ def extract(statement_texts: dict[str, str], periods: list[str]) -> dict | None:
             temperature=0,
             # Cache the long instruction block so repeat conversions are cheaper.
             system=[{"type": "text", "text": _SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            messages=[
-                {"role": "user", "content": user},
-                {"role": "assistant", "content": "{"},  # prefill to force JSON
-            ],
+            messages=[{"role": "user", "content": user + "\n\nReturn only the JSON object."}],
         )
-        raw = "{" + "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
+        raw = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
         data = _loads_lenient(raw)
         if not data:
             return None
