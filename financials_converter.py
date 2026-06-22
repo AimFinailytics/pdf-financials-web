@@ -1333,13 +1333,12 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
 
     # Column headers
     ws.row_dimensions[5].height = 26
-    ws.freeze_panes = "B6"
     h = ws.cell(5, 1, "Particulars")
     h.fill, h.font = _AS_SUBHEAD, _AS_SUB_FONT
     h.alignment = Alignment(horizontal="center", vertical="center")
     h.border = Border(top=_AS_MED, bottom=_AS_MED)
     for i, period in enumerate(periods, 2):
-        c = ws.cell(5, i, f"{period}\n(Mn)")
+        c = ws.cell(5, i, period)
         c.fill, c.font = _AS_YEAR, _AS_YEAR_FONT
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c.border = Border(top=_AS_MED, bottom=_AS_MED)
@@ -1434,11 +1433,10 @@ def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) 
         cc.fill, cc.font = _AS_SUBHEAD, _AS_SUB_FONT
         cc.alignment = Alignment(horizontal="center", vertical="center")
     for company, period, ccol in plan:
-        c = ws.cell(4, ccol, f"{period}\n(Mn)")
+        c = ws.cell(4, ccol, period)
         c.fill, c.font = _AS_YEAR, _AS_YEAR_FONT
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[4].height = 26
-    ws.freeze_panes = "B5"
 
     # ordered, classified keys (union across companies)
     keys: list[str] = []

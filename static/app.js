@@ -166,7 +166,7 @@ form.addEventListener("submit", async (event) => {
   for (const file of files) {
     payload.append("files", file);
   }
-  payload.append("use_ai", "1"); // Claude is always the engine
+  payload.append("use_ai", "1"); // AI engine is always on
 
   button.disabled = true;
   setStatus("Processing", "busy");
