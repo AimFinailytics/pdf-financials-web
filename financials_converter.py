@@ -354,137 +354,62 @@ def parse_pdf(path: Path, use_ai: bool = False) -> ParsedPdf:
     parsed = ParsedPdf(company=company, source_name=path.name, source_path=path)
     parsed.statements = {}
 
+    # Detect periods only as a HINT for the AI (it confirms / overrides them).
+    # The deterministic row parser is intentionally NOT used — Claude is the sole
+    # extraction engine (the "A2E tool"), so the parser's lower-quality rows never
+    # reach the output.
     all_periods: list[str] = []
     for statement_name, spans in statement_pages.items():
-        statement_text = _span_text(page_text, spans)
-        periods = detect_periods(statement_text, statement_name)
-        if not periods:
-            periods = detect_periods(joined_first_pages + "\n" + statement_text, statement_name)
-        if periods:
-            all_periods.extend(periods)
-        rows, labels, order = parse_statement_rows(statement_text, periods, statement_name)
-        if rows:
-            parsed.statements[statement_name] = rows
-            parsed.display_labels[statement_name] = labels
-            parsed.row_order[statement_name] = order
-
-    # Fold the separate Comprehensive Income statement's two summary lines into
-    # the Income Statement's Comprehensive Income section.
-    if comp_page is not None and "Income Statement" in parsed.statements:
-        comp_text = next((t for pn, t in pages if pn == comp_page), "")
-        if comp_text:
-            cperiods = detect_periods(comp_text, "Income Statement") or _dedupe(all_periods)
-            crows, clabels, corder = parse_statement_rows(comp_text, cperiods, "Income Statement")
-            is_rows = parsed.statements["Income Statement"]
-            is_labels = parsed.display_labels["Income Statement"]
-            is_order = parsed.row_order["Income Statement"]
-            base = (max(is_order.values()) if is_order else 0) + 1000
-            for key in crows:
-                if "comprehensive" in clabels.get(key, "").lower():
-                    is_rows[key] = crows[key]
-                    is_labels[key] = clabels[key]
-                    is_order[key] = base + corder.get(key, 0)
-
+        text = _span_text(page_text, spans)
+        all_periods.extend(detect_periods(text, statement_name) or [])
     parsed.periods = _dedupe_periods(all_periods)
-    if not parsed.periods:
-        parsed.periods = _infer_periods_from_rows(parsed.statements)
 
-    # AI-assisted extraction: when the user enables it, the LLM does the FULL
-    # structuring (the way the manual "A2E" process does), replacing the
-    # deterministic rows with its clean line items. This is the path to top
-    # quality on tricky / dense reports.
-    if use_ai:
-        # Hand the LLM the WHOLE statement-region pages (not the narrow detected
-        # spans) so it can find statements the detector mis-assigned and read
-        # messy / multi-column / digit-split tables itself — the A2E approach.
-        # Cap the page span so a stray detection can't balloon the request.
-        span_pages = sorted({p for spans in statement_pages.values() for (p, _s, _e) in spans})
-        if comp_page:
-            span_pages = sorted(set(span_pages + [comp_page]))
-        if span_pages and (span_pages[-1] - span_pages[0]) <= 12:
-            lo, hi = span_pages[0] - 1, span_pages[-1] + 1
-            region = [page_text[p] for p in range(lo, hi + 1) if p in page_text]
-        else:  # detections too far apart — fall back to the per-statement spans
-            region = [_span_text(page_text, s) for s in statement_pages.values() if s]
-        blob = "\n\n".join(t for t in region if t)
-        if blob.strip():
-            _apply_ai_full(parsed, {"Statements": blob})
+    # ENGINE — Claude only, NO fallback. Hand the LLM the whole statement-region
+    # pages so it finds every statement and reads messy/multi-column tables itself.
+    span_pages = sorted({p for spans in statement_pages.values() for (p, _s, _e) in spans})
+    if comp_page:
+        span_pages = sorted(set(span_pages + [comp_page]))
+    if span_pages and (span_pages[-1] - span_pages[0]) <= 12:
+        lo, hi = span_pages[0] - 1, span_pages[-1] + 1
+        region = [page_text[p] for p in range(lo, hi + 1) if p in page_text]
+    else:
+        region = [_span_text(page_text, s) for s in statement_pages.values() if s]
+    blob = "\n\n".join(t for t in region if t)
 
-    if not parsed.statements:
-        parsed.skipped_reason = "consolidated statement pages found but no rows could be parsed"
+    if not (blob.strip() and _apply_claude_only(parsed, blob)):
+        # No silent fallback to the deterministic parser or Gemini — fail clearly.
+        parsed.statements = {}
+        parsed.skipped_reason = "AI extraction unavailable — please try again in a moment"
 
     return parsed
 
 
-def _parse_confidence(parsed: ParsedPdf) -> int:
-    """How many of the 3 statements parsed with a usable number of rows.
-    3 = all good; lower means the deterministic pass likely missed something."""
-    good = 0
-    for statement in STATEMENTS:
-        rows = parsed.statements.get(statement, {})
-        if len(rows) >= 4:
-            good += 1
-    return good
-
-
-def _apply_ai_fallback(parsed: ParsedPdf, statement_texts: dict[str, str]) -> None:
-    """Merge Gemini-extracted rows into `parsed`, filling statements/lines the
-    deterministic parser missed. Never overwrites already-parsed rows. No-op if
-    AI isn't configured or returns nothing."""
-    try:
-        import gemini_fallback
-    except Exception:
-        return
-    ai = gemini_fallback.extract(statement_texts, parsed.periods)
-    if not ai:
-        return
-    ai_periods = ai.get("periods") or []
-    for period in ai_periods:
-        if period not in parsed.periods:
-            parsed.periods.append(period)
-    for statement, payload in ai.get("statements", {}).items():
-        rows = parsed.statements.setdefault(statement, {})
-        labels = parsed.display_labels.setdefault(statement, {})
-        order = parsed.row_order.setdefault(statement, {})
-        base = (max(order.values()) if order else 0) + 1
-        for key, values in payload.get("rows", {}).items():
-            if key in rows:  # trust the on-server deterministic value first
-                continue
-            rows[key] = values
-            labels[key] = payload.get("labels", {}).get(key, key.title())
-            order[key] = base + payload.get("order", {}).get(key, 0)
-    parsed.periods = _dedupe_periods(parsed.periods)
-
-
-def _apply_ai_full(parsed: ParsedPdf, statement_texts: dict[str, str]) -> None:
-    """REPLACE each statement with the LLM's full clean extraction (the A2E-style
-    path). Prefers the Claude API (the A2E gold standard); falls back to Gemini,
-    then to the deterministic rows. No-op if no AI is configured."""
-    ai = None
+def _apply_claude_only(parsed: ParsedPdf, blob: str) -> bool:
+    """Extract every statement via the Claude API (the A2E engine) — the SOLE
+    method, no Gemini or deterministic fallback. Returns True if Claude produced
+    at least one statement's rows, else False (caller then fails the file)."""
     try:
         import claude_extractor
-        if claude_extractor.is_configured():
-            ai = claude_extractor.extract(statement_texts, parsed.periods)
     except Exception:
-        ai = None
-    if ai is None:
-        try:
-            import gemini_fallback
-            ai = gemini_fallback.extract(statement_texts, parsed.periods)
-        except Exception:
-            ai = None
+        return False
+    if not claude_extractor.is_configured():
+        return False
+    ai = claude_extractor.extract({"Statements": blob}, parsed.periods)
     if not ai:
-        return  # keep the deterministic result if AI unavailable/failed
+        return False
     ai_periods = [p for p in (ai.get("periods") or []) if p]
     if ai_periods:
         parsed.periods = _dedupe_periods(ai_periods + parsed.periods)
+    got = False
     for statement, payload in ai.get("statements", {}).items():
         rows = payload.get("rows", {})
-        if not rows:  # AI gave nothing for this statement -> keep deterministic
+        if not rows:
             continue
         parsed.statements[statement] = rows
         parsed.display_labels[statement] = payload.get("labels", {})
         parsed.row_order[statement] = payload.get("order", {})
+        got = True
+    return got
 
 
 def detect_company(text: str) -> str | None:

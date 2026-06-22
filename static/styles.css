@@ -179,18 +179,15 @@ body {
 .trust-badge.gold { color: #8a6a12; background: rgba(217,181,86,0.12); border-color: rgba(217,181,86,0.4); }
 .trust-badge.gold i { color: var(--gold); }
 
-/* ---------- AI toggle ---------- */
-.ai-toggle {
-  display: flex; gap: 12px; align-items: flex-start; cursor: pointer;
-  padding: 13px 15px; border-radius: 13px; border: 1px solid var(--line);
-  background: linear-gradient(180deg, rgba(7,95,228,0.03), rgba(10,168,103,0.03));
-  transition: border-color 0.16s ease;
+/* ---------- engine note ---------- */
+.engine-note {
+  display: flex; gap: 10px; align-items: flex-start; margin: 0;
+  padding: 13px 15px; border-radius: 13px; border: 1px solid rgba(7,95,228,0.15);
+  background: linear-gradient(180deg, rgba(7,95,228,0.04), rgba(10,168,103,0.04));
+  font-size: 0.84rem; line-height: 1.5; color: var(--muted);
 }
-.ai-toggle:hover { border-color: var(--blue-soft); }
-.ai-toggle input { margin-top: 3px; width: 17px; height: 17px; accent-color: var(--blue-bright); flex: none; }
-.ai-toggle-text strong { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; color: var(--navy); }
-.ai-toggle-text strong i { width: 15px; height: 15px; color: var(--gold); }
-.ai-toggle-text small { display: block; margin-top: 3px; color: var(--muted); font-size: 0.78rem; line-height: 1.45; }
+.engine-note strong { color: var(--navy); }
+.engine-note i { width: 16px; height: 16px; color: var(--gold); flex: none; margin-top: 2px; }
 
 /* ---------- donation panel ---------- */
 .donate-panel {

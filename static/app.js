@@ -8,7 +8,6 @@ const resultsPanel = document.getElementById("resultsPanel");
 const outputCount = document.getElementById("outputCount");
 const downloads = document.getElementById("downloads");
 const skipped = document.getElementById("skipped");
-const useAi = document.getElementById("useAi");
 
 const signupOverlay = document.getElementById("signupOverlay");
 const signupForm = document.getElementById("signupForm");
@@ -40,17 +39,10 @@ function hideGate() {
   document.body.classList.remove("gated");
 }
 
-async function checkAccess() {
-  // The gate shows by default (markup), so a new visitor always sees it even if
-  // this check is slow/fails. Here we only DISMISS it for someone already signed
-  // up so returning users skip straight to the converter.
-  try {
-    const res = await fetch("/api/me");
-    const data = await res.json();
-    if (data.signed_up) hideGate();
-  } catch (_) {
-    /* leave the gate up; signing up again just re-captures the email */
-  }
+function checkAccess() {
+  // The gate stays visible until the visitor actually enters their email — it is
+  // NOT auto-dismissed (that caused a half-second flash for returning users).
+  // So everyone sees and uses the prompt, and every visit captures an email.
 }
 
 if (signupForm) {
@@ -174,7 +166,7 @@ form.addEventListener("submit", async (event) => {
   for (const file of files) {
     payload.append("files", file);
   }
-  payload.append("use_ai", useAi && useAi.checked ? "1" : "0");
+  payload.append("use_ai", "1"); // Claude is always the engine
 
   button.disabled = true;
   setStatus("Processing", "busy");

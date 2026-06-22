@@ -61,13 +61,11 @@
             <span class="empty">No PDFs selected yet</span>
           </div>
 
-          <label class="ai-toggle" for="useAi">
-            <input type="checkbox" id="useAi" name="use_ai" checked />
-            <span class="ai-toggle-text">
-              <strong><i data-lucide="sparkles"></i> AI-assisted extraction · top quality</strong>
-              <small>On (recommended): the AI reads and structures every line item for analyst-grade accuracy (~30s). Off: faster on-server parsing, lighter quality.</small>
-            </span>
-          </label>
+          <p class="engine-note">
+            <i data-lucide="sparkles"></i>
+            Every report is read and structured by <strong>Claude AI</strong> for analyst-grade
+            accuracy. Conversions take up to a couple of minutes — worth the wait.
+          </p>
 
           <button class="primary-action" id="convertButton" type="submit">
             <i data-lucide="sparkles"></i>
