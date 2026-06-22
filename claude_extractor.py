@@ -17,8 +17,43 @@ from __future__ import annotations
 
 import os
 
-# Reuse the JSON->ParsedPdf-shape helpers so both engines return identical data.
-from gemini_fallback import _loads_lenient, _to_parsed_shape
+# Reuse the lenient JSON loader + number coercion; this module has its own
+# compact-format shaper.
+from gemini_fallback import _loads_lenient, _to_number
+
+STATEMENTS = ("Income Statement", "Balance Sheet", "Cash Flow Statement")
+
+
+def _to_shape_compact(data: dict) -> dict:
+    """Parse the compact `[label, v1, v2, ...]` rows into the ParsedPdf shape."""
+    periods = [str(p) for p in (data.get("periods") or []) if p]
+    out: dict = {"periods": periods, "statements": {}}
+    for stmt in STATEMENTS:
+        items = data.get(stmt) or []
+        rows: dict[str, dict[str, float]] = {}
+        labels: dict[str, str] = {}
+        order: dict[str, int] = {}
+        for i, item in enumerate(items):
+            if not item or not isinstance(item, (list, tuple)):
+                continue
+            label = str(item[0]).strip()
+            if not label:
+                continue
+            values: dict[str, float] = {}
+            for j, period in enumerate(periods):
+                if j + 1 < len(item):
+                    num = _to_number(item[j + 1])
+                    if num is not None:
+                        values[period] = num
+            if not values:
+                continue
+            key = label.lower()
+            rows[key] = values
+            labels[key] = label
+            order[key] = i
+        if rows:
+            out["statements"][stmt] = {"rows": rows, "labels": labels, "order": order}
+    return out
 
 _SYSTEM = """You are a meticulous financial-statements data extractor.
 
@@ -43,16 +78,14 @@ Rules:
 - Keep the original line-item wording as the label (cleaned of note references).
 - Maintain the statement's top-to-bottom order.
 
-Return STRICT JSON only (no prose, no code fences), in this exact shape:
+Return STRICT JSON only (no prose, no code fences), in this COMPACT shape — each
+line is [label, value_for_period_1, value_for_period_2, ...] with the values in
+the SAME order as "periods" (use null for a missing value):
 {
   "periods": ["FY2023", "FY2024"],
-  "statements": {
-    "Income Statement": [
-      {"label": "Revenue from Operations", "values": {"FY2023": 16300.55, "FY2024": 16769.27}}
-    ],
-    "Balance Sheet": [],
-    "Cash Flow Statement": []
-  }
+  "Income Statement": [["Revenue from Operations", 16300.55, 16769.27]],
+  "Balance Sheet": [],
+  "Cash Flow Statement": []
 }"""
 
 
@@ -89,7 +122,7 @@ def extract(statement_texts: dict[str, str], periods: list[str]) -> dict | None:
         data = _loads_lenient(raw)
         if not data:
             return None
-        return _to_parsed_shape(data)
+        return _to_shape_compact(data)
     except Exception as exc:  # noqa: BLE001 — never break the request path
         print(f"[claude_extractor] extraction unavailable: {exc}")
         return None

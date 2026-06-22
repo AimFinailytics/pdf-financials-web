@@ -1159,23 +1159,24 @@ def build_master_workbook(grouped: dict[str, list[ParsedPdf]], out_path: Path) -
 
 
 # ----- analyst-grade statement styling (ported from the A2E layout) -----
-_AS_HEAD = PatternFill("solid", fgColor="1B3A5C")
-_AS_SUBHEAD = PatternFill("solid", fgColor="FF9900")
-_AS_SECTION = PatternFill("solid", fgColor="FFF3E0")
-_AS_TOTAL = PatternFill("solid", fgColor="FFE0B2")
-_AS_ALT = PatternFill("solid", fgColor="FAFAFA")
+# Navy / blue / gold palette matching the A2E workbook + the AimFiinsight brand.
+_AS_HEAD = PatternFill("solid", fgColor="1F3864")     # navy title bar
+_AS_SUBHEAD = PatternFill("solid", fgColor="2E75B6")  # blue subtitle / header
+_AS_SECTION = PatternFill("solid", fgColor="D6E4F7")  # light-blue section band
+_AS_TOTAL = PatternFill("solid", fgColor="BDD7EE")    # soft-blue total row
+_AS_ALT = PatternFill("solid", fgColor="F2F7FC")      # faint-blue zebra
 _AS_WHITE = PatternFill("solid", fgColor="FFFFFF")
-_AS_NOTE = PatternFill("solid", fgColor="FFF9F0")
-_AS_YEAR = PatternFill("solid", fgColor="B35900")
+_AS_NOTE = PatternFill("solid", fgColor="DEEAF1")     # light-blue note band
+_AS_YEAR = PatternFill("solid", fgColor="1F4E79")     # dark-blue period header
 
 _AS_TITLE_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=14)
-_AS_SUB_FONT = Font(name="Calibri", bold=True, color="1B3A5C", size=10)
+_AS_SUB_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
 _AS_YEAR_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
-_AS_SEC_FONT = Font(name="Calibri", bold=True, color="1B3A5C", size=10)
+_AS_SEC_FONT = Font(name="Calibri", bold=True, color="1F3864", size=10)
 _AS_NORM_FONT = Font(name="Calibri", color="000000", size=10)
 _AS_NOTE_FONT = Font(name="Calibri", italic=True, color="595959", size=9)
-_AS_THIN = Side(style="thin", color="FFB74D")
-_AS_MED = Side(style="medium", color="FF9900")
+_AS_THIN = Side(style="thin", color="B8CCE4")
+_AS_MED = Side(style="medium", color="2E75B6")
 
 # Ordered sections per statement and the label keywords that fall under each.
 _SECTIONS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
@@ -1326,7 +1327,7 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
     c.alignment = Alignment(horizontal="center", vertical="center")
     span = f"{periods[0]} to {periods[-1]}" if periods else ""
     ws.merge_cells(f"A3:{last_col}3")
-    c = ws.cell(3, 1, f"Multi-Year {span}  |  Figures in millions as reported  |  {company}")
+    c = ws.cell(3, 1, f"Consolidated  |  {span}  |  Figures as reported in the source report  |  {company}")
     c.fill, c.font = _AS_NOTE, _AS_NOTE_FONT
     c.alignment = Alignment(horizontal="center", vertical="center")
 
