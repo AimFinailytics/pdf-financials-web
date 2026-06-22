@@ -24,68 +24,112 @@ from gemini_fallback import _loads_lenient, _to_number
 STATEMENTS = ("Income Statement", "Balance Sheet", "Cash Flow Statement")
 
 
-def _to_shape_compact(data: dict) -> dict:
-    """Parse the compact `[label, v1, v2, ...]` rows into the ParsedPdf shape."""
+def _to_structured(data: dict) -> dict:
+    """Parse the structured layout rows into the ParsedPdf shape + a render layout.
+
+    Each statement is an ordered list of rows, each row a typed array:
+      ["S", "SECTION NAME"]                section header
+      ["H", "Sub-group header"]            sub-group header (no numbers)
+      ["L", "Line item", v1, v2, ...]      line item, values in `periods` order
+      ["T", "Total label", v1, v2, ...]    subtotal / total line
+    """
     periods = [str(p) for p in (data.get("periods") or []) if p]
-    out: dict = {"periods": periods, "statements": {}}
+    out: dict = {"periods": periods, "statements": {}, "layout": {}}
+    statements = data.get("statements") or data
     for stmt in STATEMENTS:
-        items = data.get(stmt) or []
+        items = statements.get(stmt) or []
         rows: dict[str, dict[str, float]] = {}
         labels: dict[str, str] = {}
         order: dict[str, int] = {}
-        for i, item in enumerate(items):
+        layout: list[tuple[str, str]] = []
+        seq = 0
+        for item in items:
             if not item or not isinstance(item, (list, tuple)):
                 continue
-            label = str(item[0]).strip()
+            tag = str(item[0]).strip().upper()
+            if tag in ("S", "H"):
+                text = str(item[1]).strip() if len(item) > 1 else ""
+                if text:
+                    layout.append((tag, text.upper() if tag == "S" else text))
+                continue
+            # default any other tag to a line item
+            if tag not in ("L", "T") or len(item) < 2:
+                # tolerate a bare [label, v1, v2...] row (no type marker)
+                if len(item) >= 2 and not str(item[0]).strip().upper() in ("S", "H"):
+                    tag, body = "L", list(item)
+                else:
+                    continue
+            else:
+                body = item[1:]
+            label = str(body[0]).strip()
             if not label:
                 continue
             values: dict[str, float] = {}
             for j, period in enumerate(periods):
-                if j + 1 < len(item):
-                    num = _to_number(item[j + 1])
+                if j + 1 < len(body):
+                    num = _to_number(body[j + 1])
                     if num is not None:
                         values[period] = num
-            if not values:
-                continue
             key = label.lower()
+            # keep first occurrence's key stable; suffix dupes so both render
+            if key in rows:
+                key = f"{key}#{seq}"
             rows[key] = values
             labels[key] = label
-            order[key] = i
+            order[key] = seq
+            layout.append((tag, key))
+            seq += 1
         if rows:
             out["statements"][stmt] = {"rows": rows, "labels": labels, "order": order}
+            out["layout"][stmt] = layout
     return out
 
-_SYSTEM = """You are a meticulous financial-statements data extractor.
+_SYSTEM = """You reproduce an equity analyst's hand-built consolidated financial model
+from the raw text of one company's annual/quarterly report.
 
-You receive the raw text of the CONSOLIDATED financial-statement pages from one
-company's annual or quarterly report. Extract EVERY line item with its numeric
-value for each reporting period, exactly as the manual analyst gold-standard does.
+For EACH statement (Income Statement, Balance Sheet, Cash Flow Statement), output an
+ORDERED list that reproduces the statement top-to-bottom, grouped into the standard
+analyst sections. Every element is ONE typed array:
+  ["S", "SECTION NAME"]                 a section header (UPPERCASE)
+  ["H", "Sub-group header"]             a grouping header that has NO numbers
+  ["L", "Line item label", v1, v2, ...] a normal line item, one value per period
+  ["T", "Total/Subtotal label", v1, ...]a subtotal or total line
 
 Rules:
-- Use ONLY the consolidated figures. Never invent, compute, or infer new lines.
-- Find all three statements even if the source text is messy, multi-column, or the
-  digits are split by spaces (e.g. "4 69.21" in a table column means 469.21 — read
-  it in the column's context).
-- A quarterly results page may show several columns (quarter + year-to-date); take
-  the FULL-YEAR / period-end columns, not the quarter-only ones.
-- Preserve sign: parentheses or a dash mean negative/zero; a bare "-" is 0.
-- Output plain numbers (strip currency symbols and thousands commas; negatives as
-  -1234.56).
-- Map each period to a label like "FY2024" using the column's year; order periods
-  oldest -> newest.
-- Classify each line into exactly one of: "Income Statement", "Balance Sheet",
-  "Cash Flow Statement".
-- Keep the original line-item wording as the label (cleaned of note references).
-- Maintain the statement's top-to-bottom order.
+- Use ONLY consolidated figures. Never invent, compute, or merge lines. Include
+  EVERY line item that appears in the source.
+- Values are in the SAME order as "periods" (oldest -> newest); use null for a
+  period with no value. Output plain numbers (no currency symbols / thousands
+  commas; negatives as -1234.56). Parentheses or a dash = negative/zero.
+- Read digits split by spaces in a column ("4 69.21" -> 469.21) in context. For a
+  quarterly page with several columns, take the full-year / period-end columns.
+- Use clean Title-Case labels ("Revenues from Franchised Restaurants",
+  "Depreciation and Amortization"), NOT raw lowercase text.
+- Mark every total/subtotal ("Total ...", "Net income", "Operating income",
+  net-cash lines, etc.) as "T", not "L".
+- Section order to use:
+  * INCOME STATEMENT: REVENUES; OPERATING COSTS AND EXPENSES; OPERATING &
+    NON-OPERATING INCOME; TAXES & BOTTOM LINE; COMPREHENSIVE INCOME (FOLD IN the
+    separate Statement of Comprehensive Income if the text contains it); PER-SHARE
+    DATA (EPS basic/diluted, dividends per share, weighted-average shares).
+  * BALANCE SHEET: CURRENT ASSETS; NON-CURRENT ASSETS; CURRENT LIABILITIES;
+    NON-CURRENT LIABILITIES; SHAREHOLDERS' EQUITY. Add ["H", ...] sub-group headers
+    where the report groups lines (e.g. "Company-Owned Restaurant Expenses").
+  * CASH FLOW: OPERATING ACTIVITIES; INVESTING ACTIVITIES; FINANCING ACTIVITIES;
+    NET CHANGE IN CASH.
 
-Return STRICT JSON only (no prose, no code fences), in this COMPACT shape — each
-line is [label, value_for_period_1, value_for_period_2, ...] with the values in
-the SAME order as "periods" (use null for a missing value):
+Return STRICT JSON only (no prose, no code fences), exactly:
 {
-  "periods": ["FY2023", "FY2024"],
-  "Income Statement": [["Revenue from Operations", 16300.55, 16769.27]],
-  "Balance Sheet": [],
-  "Cash Flow Statement": []
+  "periods": ["FY2023", "FY2024", "FY2025"],
+  "statements": {
+    "Income Statement": [
+      ["S", "REVENUES"],
+      ["L", "Revenues from Franchised Restaurants", 15437, 15715, 16548],
+      ["T", "Total Revenues", 25494, 25920, 26885]
+    ],
+    "Balance Sheet": [],
+    "Cash Flow Statement": []
+  }
 }"""
 
 
@@ -122,7 +166,7 @@ def extract(statement_texts: dict[str, str], periods: list[str]) -> dict | None:
         data = _loads_lenient(raw)
         if not data:
             return None
-        return _to_shape_compact(data)
+        return _to_structured(data)
     except Exception as exc:  # noqa: BLE001 — never break the request path
         print(f"[claude_extractor] extraction unavailable: {exc}")
         return None

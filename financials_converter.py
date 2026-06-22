@@ -135,6 +135,10 @@ class ParsedPdf:
     statements: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     display_labels: dict[str, dict[str, str]] = field(default_factory=dict)
     row_order: dict[str, dict[str, int]] = field(default_factory=dict)
+    # The AI's full analyst layout per statement: an ordered list of
+    # ("S", section_name) / ("H", subheader) / ("L", key) / ("T", key) tuples,
+    # rendered verbatim so the sheet matches the hand-built A2E structure.
+    layout: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     skipped_reason: str | None = None
 
 
@@ -409,6 +413,8 @@ def _apply_claude_only(parsed: ParsedPdf, blob: str) -> bool:
         parsed.display_labels[statement] = payload.get("labels", {})
         parsed.row_order[statement] = payload.get("order", {})
         got = True
+    # The AI's full sectioned layout (rendered verbatim, A2E-style).
+    parsed.layout = ai.get("layout", {}) or {}
     return got
 
 
@@ -1305,6 +1311,25 @@ def _as_row(ws, row, label, vals, indent=0, total=False, ncols=0):
         c.alignment = Alignment(horizontal="right", vertical="center")
 
 
+_ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"]
+
+
+def _roman(n: int) -> str:
+    return _ROMAN[n - 1] if 1 <= n <= len(_ROMAN) else str(n)
+
+
+def _pick_layout(filings: list[ParsedPdf], statement: str) -> list[tuple[str, str]]:
+    """The richest AI layout for this statement across filings (most line rows)."""
+    best: list[tuple[str, str]] = []
+    best_lines = -1
+    for filing in filings:
+        lo = getattr(filing, "layout", {}).get(statement) or []
+        n = sum(1 for tag, _ in lo if tag in ("L", "T"))
+        if n > best_lines:
+            best, best_lines = lo, n
+    return best
+
+
 def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement: str, periods: list[str]) -> None:
     ws.sheet_view.showGridLines = False
     ncols = len(periods)
@@ -1343,8 +1368,43 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c.border = Border(top=_AS_MED, bottom=_AS_MED)
 
+    # Render the AI's full analyst layout VERBATIM (the A2E approach) — sections,
+    # sub-group headers, line items and totals exactly as the AI organised them.
+    # Pick the richest layout across filings (newest/most-detailed wins).
+    layout = _pick_layout(filings, statement)
+    row = 6
+    if layout:
+        roman = statement == "Income Statement"
+        sec_n = 0
+        for tag, val in layout:
+            if tag == "S":
+                sec_n += 1
+                prefix = _roman(sec_n) if roman else chr(ord("A") + sec_n - 1)
+                ws.row_dimensions[row].height = 16
+                for col in range(1, ncols + 2):
+                    cell = ws.cell(row, col)
+                    cell.fill = _AS_SECTION
+                    if col == 1:
+                        cell.value = f"{prefix}.  {val}"
+                        cell.font = _AS_SEC_FONT
+                        cell.alignment = Alignment(horizontal="left", vertical="center")
+                row += 1
+            elif tag == "H":
+                c = ws.cell(row, 1, val)
+                c.font = _AS_SEC_FONT
+                c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+                row += 1
+            else:  # "L" or "T"
+                key = val
+                label = _display_label(filings, statement, key)
+                vals = [_value_for_period(filings, statement, key, p) for p in periods]
+                total = tag == "T" or _is_subtotal(label)
+                _as_row(ws, row, label, vals, indent=0 if total else 1, total=total, ncols=ncols)
+                row += 1
+        return
+
+    # Fallback (no AI layout): keyword-bucket into generic sections.
     keys = _ordered_keys(filings, statement)
-    # group keys by section, preserving statement order within each
     sections = _SECTIONS.get(statement, [])
     buckets: dict[int, list[str]] = {i: [] for i in range(len(sections))}
     last_section = 0
@@ -1355,14 +1415,11 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
         idx = _classify_section(statement, label)
         if idx < 0:
             if _is_noise_label(label):
-                continue  # true footnote / wrapped-line fragment
-            idx = last_section  # inherit the running section, preserving PDF order
+                continue
+            idx = last_section
         else:
             last_section = idx
         buckets[idx].append(key)
-    leftovers: list[str] = []
-
-    row = 6
     for sec_idx, (sec_label, _) in enumerate(sections):
         sec_keys = buckets[sec_idx]
         if not sec_keys:
@@ -1382,11 +1439,6 @@ def write_statement_sheet(ws, company: str, filings: list[ParsedPdf], statement:
             total = _is_subtotal(label)
             _as_row(ws, row, label, vals, indent=0 if total else 1, total=total, ncols=ncols)
             row += 1
-    for key in leftovers:
-        label = _display_label(filings, statement, key)
-        vals = [_value_for_period(filings, statement, key, p) for p in periods]
-        _as_row(ws, row, label, vals, indent=1, total=_is_subtotal(label), ncols=ncols)
-        row += 1
 
 
 def write_master_sheet(ws, grouped: dict[str, list[ParsedPdf]], statement: str) -> None:
